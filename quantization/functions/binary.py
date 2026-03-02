@@ -1,11 +1,13 @@
 import torch
 
 
-class STEBinary(torch.autograd.Function):
+class _STEBinary(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x):
         ctx.save_for_backward(x)
-        return x.sign()
+        y = x.sign()
+        y[y == 0] = 1
+        return y
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -15,12 +17,14 @@ class STEBinary(torch.autograd.Function):
         return grad_output
 
 
-class SmoothSign(torch.autograd.Function):
+class _SmoothSign(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, alpha=100):
         ctx.alpha = alpha
         ctx.save_for_backward(x)
-        return x.sign()
+        y = x.sign()
+        y[y == 0] = 1
+        return y
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -28,3 +32,7 @@ class SmoothSign(torch.autograd.Function):
         alpha = ctx.alpha
         grad_input = grad_output * alpha * (1 - torch.tanh(alpha * x)**2)
         return grad_input, None
+
+
+STEBinary = _STEBinary.apply
+SmoothSign = _SmoothSign.apply

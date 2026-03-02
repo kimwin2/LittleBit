@@ -32,6 +32,7 @@ The codebase currently supports the following architectures:
 * ✅ **Phi-4**
 * ✅ **Qwen2.5 (QwQ)**
 * ✅ **Gemma 2** & **Gemma 3**
+* ✅ **Qwen3**
 
 ---
 
@@ -78,6 +79,7 @@ CUDA_VISIBLE_DEVICES=0 python -m main \
     --residual True \
     --eff_bit 1.0 \
     --kv_factor 1.0 \
+    --min_split_dim 8 \
     --l2l_loss_scale 10.0
 ```
 
@@ -88,7 +90,7 @@ deepspeed --num_gpus=4 main.py \
     --model_id meta-llama/Llama-2-7b-hf \
     --dataset c4_wiki \
     --save_dir ./outputs/Llama-2-7b-LittleBit \
-    --ds_config_path configs/ds_config.json \
+    --ds_config_path configs/zero3.json \
     --num_train_epochs 5.0 \
     --per_device_train_batch_size 4 \
     --lr 4e-05 \
@@ -96,25 +98,50 @@ deepspeed --num_gpus=4 main.py \
     --quant_func SmoothSign \
     --quant_mod LittleBitLinear \
     --residual True \
-    --eff_bit 1.0
+    --eff_bit 1.0 \
+    --kv_factor 1.0 \
+    --min_split_dim 8
 ```
 
 ### 2\. Evaluation
 
-Evaluate the trained LittleBit model on Perplexity (PPL) tasks and Zero-shot benchmarks.
+Evaluate the trained LittleBit model on Perplexity (PPL) tasks and Zero-shot benchmarks. You can evaluate a locally trained model or one hosted directly on the Hugging Face Hub.
+
+**Standard Evaluation:**
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python -m eval \
-    --model_type llama \
+# From a local directory
+CUDA_VISIBLE_DEVICES=0 python eval.py \
     --model_id ./outputs/Llama-2-7b-LittleBit \
-    --quant_func SmoothSign \
-    --quant_mod LittleBitLinear \
-    --residual True \
-    --eff_bit 1.0 \
-    --kv_factor 1.0 \
+    --seqlen 2048 \
     --ppl_task wikitext2,c4 \
     --zeroshot_task boolq,piqa,hellaswag,winogrande,arc_easy,arc_challenge,openbookqa
+
+# From the Hugging Face Hub
+CUDA_VISIBLE_DEVICES=0 python eval.py \
+    --model_id username/littlebit-llama-7b-0.1bpw \
+    --seqlen 2048 \
+    --ppl_task wikitext2
 ```
+
+**Evaluating Legacy Models (Manual Override):**
+If you are evaluating older models that do not contain the new `littlebit_config.json` file, you can explicitly provide the quantization parameters via CLI. These arguments will override any saved configurations:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python eval.py \
+    --model_id ./outputs/Legacy-Llama-2-7b \
+    --quant_func SmoothSign \
+    --quant_mod LittleBitLinear \
+    --num_expert 4 \
+    --split_dim 1024
+```
+
+> [!NOTE]
+> **Parameter Loading Priority:**
+> The evaluation script automatically loads quantization parameters in the following order:
+> 1. **Explicit CLI arguments** (Highest priority, overrides everything else)
+> 2. **`littlebit_config.json`** in the model directory
+> 3. **`config.json`** (Fallback for older checkpoints)
 
 -----
 

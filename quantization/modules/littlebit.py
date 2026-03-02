@@ -1,5 +1,8 @@
+import os
 import torch
 import torch.nn as nn
+
+from quantization.utils.binary_packer import binary_packer
 
 
 class LittleBitLinear(nn.Module):
@@ -19,6 +22,9 @@ class LittleBitLinear(nn.Module):
         self.quant_func = quant_func
         self.residual = residual
 
+        # Flag to track if weights are binarized to int8 for inference
+        self._binarized = False
+
         eff_bit_target = eff_bit
 
         a, b = self.in_features, self.out_features
@@ -36,7 +42,10 @@ class LittleBitLinear(nn.Module):
         self.register_buffer("_split_dim_final", torch.tensor(final_split_dim))
         self.register_buffer("_eff_bit_actual", torch.tensor(eff_bit_actual))
 
-        self._initialize_parameters()
+        if self.do_train and hasattr(self, 'weight') and self.weight is not None:
+            self._initialize_parameters()
+        else:
+            self._initialize_empty_parameters()
 
     @staticmethod
     def _estimate_split_dim(a, b, eff_bit_target, residual) -> float | None:
@@ -89,23 +98,12 @@ class LittleBitLinear(nn.Module):
         hidden_output_dim = tuple(seqlen)
         x = x.view(-1, hidden_dim)
 
-        Vq = self.quantize(self.V)
-        Uq = self.quantize(self.U)
-        v2 = self.v2
-        v1u2 = self.v1 * self.u2
-        u1 = self.u1
-
-        # ((((x * v2) @ Vq^T) * (v1 * u2)) @ Uq^T) * u1
-        y = ((((x * v2) @ Vq.t()) * v1u2) @ Uq.t()) * u1
+        # Compute main forward pass
+        y = self._compute_forward(x, self.V, self.U, self.v2, self.v1, self.u2, self.u1)
 
         if self.residual:
-            Vq_R = self.quantize(self.V_R)
-            Uq_R = self.quantize(self.U_R)
-            v2_R = self.v2_R
-            v1u2_R = self.v1_R * self.u2_R
-            u1_R = self.u1_R
-
-            res = ((((x * v2_R) @ Vq_R.t()) * v1u2_R) @ Uq_R.t()) * u1_R
+            # Compute residual forward pass
+            res = self._compute_forward(x, self.V_R, self.U_R, self.v2_R, self.v1_R, self.u2_R, self.u1_R)
             y = y + res
 
         if self.bias is not None:
@@ -113,8 +111,21 @@ class LittleBitLinear(nn.Module):
         y = y.reshape(hidden_output_dim)
         return y
 
+    def _compute_forward(self, x, V, U, v2, v1, u2, u1):
+        """Helper method to compute the forward pass for both main and residual components."""
+        Vq = self.quantize(V.to(x.dtype))
+        Uq = self.quantize(U.to(x.dtype))
+        v1u2 = v1 * u2
+
+        # ((((x * v2) @ Vq^T) * (v1 * u2)) @ Uq^T) * u1
+        return ((((x * v2) @ Vq.t()) * v1u2) @ Uq.t()) * u1
+
     def quantize(self, x):
-        return self.quant_func().apply(x)
+        # If weights are already binarized, return them directly
+        if self._binarized:
+            return x
+        # Otherwise, apply quantization function
+        return self.quant_func(x)
 
     def extra_repr(self):
         params = {
@@ -130,32 +141,90 @@ class LittleBitLinear(nn.Module):
 
         return ", ".join(f"{key}={value}" for key, value in params.items())
 
+    def _initialize_empty_parameters(self):
+        """Initialize with empty parameters for memory efficiency during inference"""
+        dtype = torch.bfloat16  # temporary dtype, actual values loaded from state_dict
+        device = "meta"  # use meta device to prevent actual memory allocation
+
+        # Helper function to create parameters with consistent settings
+        def create_param(*shape):
+            return nn.Parameter(torch.empty(*shape, device=device, dtype=dtype), requires_grad=self.do_train)
+
+        # Initialize main parameters
+        self.U = create_param(self.out_features, self.split_dim)
+        self.V = create_param(self.split_dim, self.in_features)
+        self.u1 = create_param(1, self.out_features)
+        self.u2 = create_param(1, self.split_dim)
+        self.v1 = create_param(1, self.split_dim)
+        self.v2 = create_param(1, self.in_features)
+
+        if self.residual:
+            # Initialize residual parameters
+            self.U_R = create_param(self.out_features, self.split_dim)
+            self.V_R = create_param(self.split_dim, self.in_features)
+            self.u1_R = create_param(1, self.out_features)
+            self.u2_R = create_param(1, self.split_dim)
+            self.v1_R = create_param(1, self.split_dim)
+            self.v2_R = create_param(1, self.in_features)
+
+        # Delete original weight
+        if hasattr(self, 'weight'):
+            del self.weight
+        self.register_parameter('weight', None)
+
     def _initialize_parameters(self):
-        W = self.weight.data.float() if self.do_train else None
+        # Only perform actual decomposition when `do_train` is True.
+        W = self.weight.data.float() if self.do_train and self.weight is not None else None
+
         U, V, u1, u2, v1, v2 = self._decompose_matrix(W)
 
-        self.register_parameter('U', nn.Parameter(U))
-        self.register_parameter('V', nn.Parameter(V))
-        self.register_parameter('v1', nn.Parameter(v1))
-        self.register_parameter('v2', nn.Parameter(v2))
-        self.register_parameter('u1', nn.Parameter(u1))
-        self.register_parameter('u2', nn.Parameter(u2))
+        # Helper function to create parameters with consistent settings
+        def create_param(tensor):
+            return nn.Parameter(tensor, requires_grad=self.do_train)
+
+        # Initialize main parameters
+        self.U = create_param(U)
+        self.V = create_param(V)
+        self.v1 = create_param(v1)
+        self.v2 = create_param(v2)
+        self.u1 = create_param(u1)
+        self.u2 = create_param(u2)
 
         if self.residual:
             residual_W = None
             if self.do_train:
-                UV_approx = (U.sign() * (u1.t() @ u2)) @ (V.sign() * (v1.t() @ v2))
-                residual_W = self.weight.data.float() - UV_approx
+                # Offload the heavy W_approx matrix multiplication to GPU to prevent CPU bottleneck
+                local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+                calc_device = torch.device(f"cuda:{local_rank}") if torch.cuda.is_available() else self.weight.device
+
+                # Temporarily move components to calc_device
+                U_g = self.quantize(U).to(calc_device)
+                V_g = self.quantize(V).to(calc_device)
+                u1_g, u2_g = u1.to(calc_device), u2.to(calc_device)
+                v1_g, v2_g = v1.to(calc_device), v2.to(calc_device)
+
+                # Calculate approximation using decomposed matrices on GPU
+                W_approx_g = (U_g * (u1_g.t() @ u2_g)) @ (V_g * (v1_g.t() @ v2_g))
+
+                # Move the result back to the original device (CPU) for subtraction
+                residual_W = self.weight.data.float() - W_approx_g.to(self.weight.device)
+
+                # Clean up GPU memory
+                del U_g, V_g, u1_g, u2_g, v1_g, v2_g, W_approx_g
+
             U_R, V_R, u1_R, u2_R, v1_R, v2_R = self._decompose_matrix(residual_W)
 
-            self.register_parameter('U_R', nn.Parameter(U_R))
-            self.register_parameter('V_R', nn.Parameter(V_R))
-            self.register_parameter('v1_R', nn.Parameter(v1_R))
-            self.register_parameter('v2_R', nn.Parameter(v2_R))
-            self.register_parameter('u1_R', nn.Parameter(u1_R))
-            self.register_parameter('u2_R', nn.Parameter(u2_R))
+            # Initialize residual parameters
+            self.U_R = create_param(U_R)
+            self.V_R = create_param(V_R)
+            self.v1_R = create_param(v1_R)
+            self.v2_R = create_param(v2_R)
+            self.u1_R = create_param(u1_R)
+            self.u2_R = create_param(u2_R)
 
+        # After decomposition, the original weight is no longer needed, so set it to None
         self.register_parameter('weight', None)
+        self._binarized = False
 
     def _decompose_matrix(self, X=None):
         """
@@ -168,20 +237,43 @@ class LittleBitLinear(nn.Module):
             v1, v2: The pair from further decomposition on V.
         """
         if self.do_train:
+            assert X is not None, "Weight matrix X must be provided for training initialization."
             assert X.shape[0] == self.out_features
             assert X.shape[1] == self.in_features
-            U_t, S_t, Vh_t = torch.linalg.svd(X, full_matrices=False)
+
+            original_device = X.device
+
+            # Get LOCAL_RANK for DeepSpeed/DDP compatibility. Default to 0 for single GPU.
+            local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+            calc_device = torch.device(f"cuda:{local_rank}") if torch.cuda.is_available() else original_device
+
+            # Move tensor to the target device for faster computation
+            X_calc = X.to(calc_device)
+
+            # Use svd_lowrank instead of linalg.svd to drastically speed up initialization
+            U_t, S_t, V_t = torch.svd_lowrank(X_calc, q=self.split_dim)
+            Vh_t = V_t.t()
+
             sqrt_S = torch.sqrt(torch.diag(S_t))[:, :self.split_dim]
+
             U = (U_t @ sqrt_S).contiguous()
             V = (sqrt_S.t() @ Vh_t).contiguous()
 
-            v1, v2 = self._rank_one_decompose(torch.abs(V))
-            u1, u2 = self._rank_one_decompose(torch.abs(U))
+            v1, v2 = self._rank_one_decompose(torch.abs(V), calc_device=calc_device)
+            u1, u2 = self._rank_one_decompose(torch.abs(U), calc_device=calc_device)
 
-            dtype = torch.bfloat16
-            U, V = U.to(dtype), V.to(dtype)
-            v1, v2 = v1.to(dtype), v2.to(dtype)
-            u1, u2 = u1.to(dtype), u2.to(dtype)
+            dtype = X.dtype
+            # Safely move the computed tensors back to the original device (e.g., CPU for ZeRO-3)
+            U = U.to(device=original_device, dtype=dtype)
+            V = V.to(device=original_device, dtype=dtype)
+            v1 = v1.to(device=original_device, dtype=dtype)
+            v2 = v2.to(device=original_device, dtype=dtype)
+            u1 = u1.to(device=original_device, dtype=dtype)
+            u2 = u2.to(device=original_device, dtype=dtype)
+
+            # Explicitly delete temporary GPU tensors to prevent OOM
+            del X_calc, U_t, S_t, V_t, Vh_t
+
         else:
             U = torch.empty(self.out_features, self.split_dim)
             V = torch.empty(self.split_dim, self.in_features)
@@ -191,15 +283,66 @@ class LittleBitLinear(nn.Module):
             v2 = torch.empty(1, self.in_features)
         return U, V, u1, u2, v1, v2
 
-    def _rank_one_decompose(self, X):
+    def _rank_one_decompose(self, X, calc_device=None):
         """
         Perform rank-one decomposition on matrix X via SVD and return two vectors.
         """
-        U, S, Vh = torch.linalg.svd(X, full_matrices=False)
+        original_device = X.device
+        if calc_device is None:
+            # Apply LOCAL_RANK logic to ensure strict device placement
+            local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+            calc_device = torch.device(f"cuda:{local_rank}") if torch.cuda.is_available() else original_device
+
+        X_calc = X.to(calc_device)
+
+        # Use svd_lowrank with q=1 for ultra-fast rank-one decomposition
+        U, S, V = torch.svd_lowrank(X_calc, q=1)
+        Vh = V.t()
+
         sqrt_S0 = torch.sqrt(S[0])
         u_component = (U[:, :1] * sqrt_S0).t().contiguous()
         v_component = (sqrt_S0 * Vh[:1, :]).contiguous()
         return u_component, v_component
+
+    def pack_weights(self, *args, **kwargs):
+        """
+        Pack binary weights. Shapes are converted to tensors to ensure
+        the state_dict contains only tensors.
+        """
+        packed_data = {}
+
+        # Helper function to binarize and pack a parameter
+        def pack_param(param, name):
+            param_bin = self.quantize(param.data).to(torch.int8)
+            packed_data[f'{name}_packed'] = binary_packer(param_bin)
+            packed_data[f'{name}_shape'] = torch.tensor(param.shape, dtype=torch.long)
+
+        # Pack main parameters
+        pack_param(self.U, 'U')
+        pack_param(self.V, 'V')
+
+        if self.residual:
+            # Pack residual parameters
+            pack_param(self.U_R, 'U_R')
+            pack_param(self.V_R, 'V_R')
+
+        return packed_data
+
+    def state_dict(self, *args, **kwargs):
+        """Always return the state_dict in a binarized & packed format."""
+        prefix = kwargs.get('prefix', '')
+        state = super().state_dict(*args, **kwargs)
+
+        keys_to_remove = [k for k in state.keys() if k.startswith(prefix + 'U') or k.startswith(prefix + 'V')]
+        for k in keys_to_remove:
+            if k in state:
+                del state[k]
+
+        packed_weights = self.pack_weights()
+        for k, v in packed_weights.items():
+            state[prefix + k] = v
+
+        return state
 
     @property
     def eff_bit_target(self):

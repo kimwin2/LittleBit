@@ -15,8 +15,8 @@ from transformers import default_data_collator
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments, set_seed
 from transformers.integrations.deepspeed import HfDeepSpeedConfig
 
-from quantization.utils import get_quant_func_and_mod, patch_inst
-from utils.datautils import get_qat_dataset
+from quantization.utils import apply_littlebit_patch
+from utils.datautils import prepare_dataset, load_tokenizer
 from utils.kd_utils import KDTrainer
 from utils.misc import setup_logger
 from utils.utils import prepare_model_for_training, print_trainable_parameters
@@ -79,6 +79,7 @@ def get_args():
     parser.add_argument("--split_dim", type=int, default=1024)
     parser.add_argument("--eff_bit", type=float, default=1.0)
     parser.add_argument("--kv_factor", type=float, default=1.0)
+    parser.add_argument("--min_split_dim", type=int, default=8)
 
     args = parser.parse_args()
 
@@ -117,74 +118,22 @@ def get_training_arguments(args, save_dir):
     )
 
 
-def prepare_dataset(args, tokenizer):
-    text = tokenizer.__repr__()
-    hash_key = re.sub(r"name_or_path=[^,]+,?\s*", "", text)
-
-    hash_value = hashlib.sha256(hash_key.encode()).hexdigest()[:7]
-    dataset = os.path.join(args.data_root, args.dataset, hash_value)
-
-    logger.info(f"Attempting to load dataset from disk at '{dataset}'")
-    try:
-        datasets = load_from_disk(dataset)
-        logger.info(f"Successfully loaded dataset from disk at '{dataset}'")
-    except (FileNotFoundError, OSError) as e:
-        logger.warning(f"Failed to load dataset from disk at '{dataset}': {e}")
-        logger.info("Generating new dataset using get_qat_dataset")
-        datasets = get_qat_dataset(args.dataset, tokenizer)
-        datasets.save_to_disk(dataset)
-        logger.info(f"Dataset saved to disk at '{dataset}'")
-        with open(os.path.join(dataset, "tokenizer_info"), "w") as f:
-            f.write(hash_key)
-    return datasets
-
-
-def load_tokenizer(model_id):
-    return AutoTokenizer.from_pretrained(model_id, use_fast=False, trust_remote_code=True)
-
-
 def load_student_model(args, device_map, torch_dtype):
     model = AutoModelForCausalLM.from_pretrained(
         args.model_id,
         torch_dtype=torch_dtype,
         device_map="cpu",
         low_cpu_mem_usage=True,
+        trust_remote_code=True,
     )
     model.config.use_cache = False
     prepare_model_for_training(model)
 
-    quant_func, quant_mod = get_quant_func_and_mod(args.quant_func, args.quant_mod)
+    print("INFO: Applying quantization patch...")
+    model = apply_littlebit_patch(model, args, do_train=True)
 
-    KV_PATTERN = [re.compile(r'\.k_proj$'), re.compile(r'\.v_proj$')]
-    mapping = {nn.Linear: quant_mod}
-
-    convert_kwargs = [
-        ([nn.Linear], {
-            "do_train": True,
-            "quant_func": quant_func,
-            "residual": args.residual,
-            "split_dim": args.split_dim,
-            "eff_bit": args.eff_bit,
-        }),
-        (KV_PATTERN, {
-            "ratio_factor": args.kv_factor,
-        }),
-    ]
-
-    if "phi" in args.model_id.lower():
-        from transformers.models.phi3.modeling_phi3 import Phi3Attention
-        from quantization.modules.attention import PhiQKVSplitAttention
-
-        mapping.update({Phi3Attention: PhiQKVSplitAttention})
-        convert_kwargs.append(([Phi3Attention], {'config': model.config}))
-
-    patch_inst(
-        model,
-        convert_kwargs=convert_kwargs,
-        mapping=mapping,
-        exclude_names=["lm_head"],
-        device_map=device_map,
-    )
+    if device_map:
+        model.to(device_map if isinstance(device_map, (str, torch.device)) else list(device_map.values())[0])
 
     print_trainable_parameters(model)
     return model
@@ -271,6 +220,99 @@ def main():
     trainer.train()
 
     save_artifacts(trainer, model, tokenizer, save_dir, args)
+
+
+def save_artifacts(trainer, model, tokenizer, save_dir, args):
+    try:
+        logger.info("Starting artifact saving process (Grouped Chunk Strategy)...")
+
+        if hasattr(trainer, 'accelerator'):
+            unwrapped_model = trainer.accelerator.unwrap_model(model)
+        else:
+            unwrapped_model = model
+            while hasattr(unwrapped_model, 'module'):
+                unwrapped_model = unwrapped_model.module
+
+        use_ds = (args.ds_config_path is not None)
+        final_cpu_state_dict = {}
+
+        if use_ds:
+            logger.info("DeepSpeed ZeRO-3 enabled. Gathering parameters in groups...")
+
+            LAYER_CHUNK_SIZE = 4
+            for name, module in unwrapped_model.named_children():
+                if isinstance(module, torch.nn.ModuleList):
+                    num_layers = len(module)
+                    for i in range(0, num_layers, LAYER_CHUNK_SIZE):
+                        end_idx = min(i + LAYER_CHUNK_SIZE, num_layers)
+                        layer_group = module[i:end_idx]
+
+                        logger.info(f"Gathering layers {i} to {end_idx-1}...")
+
+                        with deepspeed.zero.GatheredParameters(layer_group.parameters(), modifier_rank=0):
+                            if args.local_rank == 0 or args.local_rank == -1:
+                                for idx, layer in enumerate(layer_group):
+                                    layer_global_idx = i + idx
+                                    layer_state_dict = layer.state_dict()
+                                    for k, v in layer_state_dict.items():
+                                        final_cpu_state_dict[f"{name}.{layer_global_idx}.{k}"] = v.cpu()
+
+                else:
+                    logger.info(f"Processing module: {name}")
+                    with deepspeed.zero.GatheredParameters(module.parameters(), modifier_rank=0):
+                        if args.local_rank == 0 or args.local_rank == -1:
+                            module_state_dict = module.state_dict()
+                            for k, v in module_state_dict.items():
+                                final_cpu_state_dict[f"{name}.{k}"] = v.cpu()
+
+            remaining_params = [p for n, p in unwrapped_model.named_parameters() if '.' not in n]
+            if remaining_params:
+                with deepspeed.zero.GatheredParameters(remaining_params, modifier_rank=0):
+                    if args.local_rank == 0 or args.local_rank == -1:
+                        for n, p in unwrapped_model.named_parameters():
+                            if '.' not in n:
+                                final_cpu_state_dict[n] = p.cpu()
+        else:
+            final_cpu_state_dict = {k: v.cpu() for k, v in unwrapped_model.state_dict().items()}
+
+        if args.local_rank == 0 or args.local_rank == -1:
+            logger.info("Saving to disk...")
+
+            # Automatically save quantization parameters in config
+            quant_params = {
+                "quant_func": getattr(args, "quant_func", "STEBinary"),
+                "eff_bit": getattr(args, "eff_bit", 1.0),
+                "split_dim": getattr(args, "split_dim", 1024),
+                "residual": getattr(args, "residual", False),
+                "kv_factor": getattr(args, "kv_factor", 1.0),
+                "min_split_dim": getattr(args, "min_split_dim", 8),
+                "quant_mod": getattr(args, "quant_mod", "LittleBitLinear"),
+            }
+
+            littlebit_config_path = os.path.join(save_dir, "littlebit_config.json")
+            with open(littlebit_config_path, "w", encoding="utf-8") as f:
+                json.dump(quant_params, f, indent=2)
+            logger.info(f"Saved LittleBit config to {littlebit_config_path}")
+
+            for key, value in quant_params.items():
+                setattr(unwrapped_model.config, key, value)
+
+            unwrapped_model.config.use_cache = True
+
+            for k, v in final_cpu_state_dict.items():
+                if "packed" not in k and "shape" not in k and v.dtype == torch.float32:
+                    final_cpu_state_dict[k] = v.to(torch.bfloat16)
+
+            unwrapped_model.save_pretrained(save_dir, state_dict=final_cpu_state_dict, safe_serialization=True)
+            tokenizer.save_pretrained(save_dir)
+
+            logger.info("Artifacts saved successfully.")
+            del final_cpu_state_dict
+            import gc
+            gc.collect()
+
+    except Exception as save_err:
+        logger.error(f"Failed during final save/log: {save_err}", exc_info=True)
 
 
 if __name__ == "__main__":
