@@ -80,7 +80,7 @@ def prepare_dataset(args, tokenizer):
     except (FileNotFoundError, OSError) as e:
         logger.warning(f"Failed to load dataset from disk at '{dataset}': {e}")
         logger.info("Generating new dataset using get_qat_dataset")
-        datasets = get_qat_dataset(args.dataset, tokenizer)
+        datasets = get_qat_dataset(args.dataset, tokenizer, sharegpt_path=getattr(args, 'sharegpt_path', None))
         datasets.save_to_disk(dataset)
         logger.info(f"Dataset saved to disk at '{dataset}'")
         with open(os.path.join(dataset, "tokenizer_info"), "w") as f:
@@ -101,14 +101,101 @@ def load_tokenizer(model_id):
     return tokenizer
 
 
-def get_qat_dataset(name, tokenizer):
+def get_qat_dataset(name, tokenizer, sharegpt_path=None):
     if name == "wikitext2":
         data = get_wikitext2_train(tokenizer=tokenizer)
     elif name == "c4":
         data = get_c4_train(tokenizer=tokenizer)
     elif name == "c4_wiki":
         data = get_c4_wiki_train(tokenizer=tokenizer)
+    elif name == "wikitext2_sharegpt":
+        data = get_wikitext2_sharegpt_train(tokenizer=tokenizer, sharegpt_path=sharegpt_path)
     return data
+
+
+def get_wikitext2_sharegpt_train(tokenizer, sharegpt_path=None, seed=0, seqlen=2048):
+    """Mixed wikitext2 + ShareGPT dataset for QAT training."""
+    # --- Part 1: Wikitext2 ---
+    wiki_dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
+    wiki_text = "\n\n".join(wiki_dataset["text"])
+
+    # --- Part 2: ShareGPT ---
+    sharegpt_texts = []
+    if sharegpt_path and os.path.exists(sharegpt_path):
+        import json as _json
+        logger.info(f"Loading ShareGPT data from local path: {sharegpt_path}")
+        with open(sharegpt_path, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    item = _json.loads(line.strip())
+                    # Support various ShareGPT formats
+                    if "conversations" in item:
+                        for turn in item["conversations"]:
+                            content = turn.get("value", turn.get("content", ""))
+                            if content:
+                                sharegpt_texts.append(content)
+                    elif "text" in item:
+                        sharegpt_texts.append(item["text"])
+                except _json.JSONDecodeError:
+                    continue
+    else:
+        logger.info("Loading ShareGPT from HuggingFace: anon8231489123/ShareGPT_Vicuna_unfiltered")
+        try:
+            sharegpt_dataset = load_dataset(
+                "anon8231489123/ShareGPT_Vicuna_unfiltered",
+                "default",
+                split="train",
+            )
+            for item in sharegpt_dataset:
+                if "conversations" in item and item["conversations"]:
+                    for turn in item["conversations"]:
+                        content = turn.get("value", turn.get("content", ""))
+                        if content:
+                            sharegpt_texts.append(content)
+        except Exception as e:
+            logger.warning(f"Failed to load ShareGPT from HuggingFace: {e}. Using wikitext2 only.")
+
+    sharegpt_text = "\n\n".join(sharegpt_texts) if sharegpt_texts else ""
+
+    # --- Combine ---
+    combined_text = wiki_text + "\n\n" + sharegpt_text if sharegpt_text else wiki_text
+
+    combined_dataset = datasets.Dataset.from_dict({"text": [combined_text]})
+    combined_dataset = (
+        combined_dataset
+        .add_column(name="timestamp", column=[None for _ in range(len(combined_dataset["text"]))])
+        .add_column(name="url", column=combined_dataset["text"])
+    )
+
+    column_names = list(combined_dataset.features)
+    text_column_name = "text" if "text" in column_names else column_names[0]
+
+    def tokenize_function(examples):
+        return tokenizer(examples[text_column_name])
+
+    tokenized_datasets = combined_dataset.map(
+        tokenize_function,
+        batched=True,
+        remove_columns=column_names,
+    )
+
+    block_size = seqlen
+
+    def group_texts(examples):
+        concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
+        total_length = len(concatenated_examples[list(examples.keys())[0]])
+        if total_length >= block_size:
+            total_length = (total_length // block_size) * block_size
+        result = {
+            k: [t[i:i + block_size] for i in range(0, total_length, block_size)]
+            for k, t in concatenated_examples.items()
+        }
+        result["labels"] = result["input_ids"].copy()
+        return result
+
+    processed_dataset = tokenized_datasets.map(group_texts, batched=True)
+    logger.info(f"wikitext2_sharegpt dataset prepared: {len(processed_dataset)} samples")
+    return processed_dataset
 
 
 def get_eval_loaders(name, tokenizer):
