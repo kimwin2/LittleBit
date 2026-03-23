@@ -38,9 +38,11 @@ from transformers import AutoModelForCausalLM
 
 from speculative_decoding import (
     MatryoshkaDraftModel, MatryoshkaTargetModel, FPTargetModel,
-    speculative_decode, autoregressive_generate, str2bool,
+    speculative_decode, speculative_decode_tree,
+    autoregressive_generate, str2bool,
     load_target_model,
 )
+from tree_utils import generate_tree_buffers, TREE_PRESETS
 from utils.datautils import load_tokenizer
 from utils.misc import setup_logger
 
@@ -183,6 +185,10 @@ def evaluate_benchmark(
     greedy: bool = True,
     eos_token_id: int = 2,
     device: torch.device = torch.device("cuda"),
+    decode_mode: str = "serial",
+    tree_buffers: dict = None,
+    top_k: int = 10,
+    temperature: float = 1.0,
 ) -> Dict:
     """Run evaluation on a set of prompts with multiple draft lengths."""
     
@@ -261,16 +267,30 @@ def evaluate_benchmark(
                 input_ids = inputs["input_ids"]
                 attention_mask = inputs.get("attention_mask", None)
                 
-                output_ids, stats = speculative_decode(
-                    draft_model=draft_model,
-                    target_model=target_model,
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    max_new_tokens=max_new_tokens,
-                    draft_length=K,
-                    greedy=greedy,
-                    eos_token_id=eos_token_id,
-                )
+                if decode_mode == "serial":
+                    output_ids, stats = speculative_decode(
+                        draft_model=draft_model,
+                        target_model=target_model,
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        max_new_tokens=max_new_tokens,
+                        draft_length=K,
+                        greedy=greedy,
+                        eos_token_id=eos_token_id,
+                    )
+                else:  # tree
+                    output_ids, stats = speculative_decode_tree(
+                        draft_model=draft_model,
+                        target_model=target_model,
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        max_new_tokens=max_new_tokens,
+                        tree_buffers=tree_buffers,
+                        top_k=top_k,
+                        temperature=temperature,
+                        greedy=greedy,
+                        eos_token_id=eos_token_id,
+                    )
                 
                 spec_stats_list.append(stats)
                 output_text = tokenizer.decode(output_ids[0][input_ids.shape[1]:], skip_special_tokens=True)
@@ -383,6 +403,14 @@ def main():
     parser.add_argument("--target_mode", type=str, default="fp",
                         choices=["fp", "matryoshka"],
                         help="Target model type: 'fp'=original FP model, 'matryoshka'=0.1+0.9 combined")
+    parser.add_argument("--decode_mode", type=str, default="serial",
+                        choices=["serial", "tree"],
+                        help="Decode mode: 'serial'=sequential draft, 'tree'=EAGLE tree attention")
+    parser.add_argument("--tree_preset", type=str, default="default",
+                        choices=["small", "default", "large"],
+                        help="Tree structure preset (for tree mode)")
+    parser.add_argument("--top_k", type=int, default=10,
+                        help="Top-K for tree draft expansion (tree mode only)")
     parser.add_argument("--benchmark", type=str, default="all",
                         choices=["all", "mt_bench", "gsm8k", "humaneval", "summarization"],
                         help="Which benchmark to run")
@@ -417,6 +445,13 @@ def main():
     logger.info(f"Loading target model ({target_desc})...")
     target_model = load_target_model(args, device)
     
+    # Prepare tree buffers if tree mode
+    tree_buffers = None
+    if args.decode_mode == "tree":
+        tree_choices = TREE_PRESETS[args.tree_preset]
+        tree_buffers = generate_tree_buffers(tree_choices, device=str(device))
+        logger.info(f"Tree buffers: {tree_buffers['tree_len']} nodes")
+    
     # Determine benchmarks to run
     if args.benchmark == "all":
         benchmarks = list(BENCHMARK_LOADERS.keys())
@@ -427,7 +462,7 @@ def main():
     
     for bench_name in benchmarks:
         logger.info(f"\n{'='*60}")
-        logger.info(f"Running benchmark: {bench_name}")
+        logger.info(f"Running benchmark: {bench_name} (decode_mode={args.decode_mode})")
         logger.info(f"{'='*60}")
         
         prompts = BENCHMARK_LOADERS[bench_name](max_samples=args.max_samples)
@@ -443,6 +478,9 @@ def main():
             greedy=greedy,
             eos_token_id=eos_token_id,
             device=device,
+            decode_mode=args.decode_mode,
+            tree_buffers=tree_buffers,
+            top_k=args.top_k,
         )
         
         all_results.append(result)

@@ -1,24 +1,24 @@
 """
 Speculative Decoding with Matryoshka LittleBit Models
 
+Supports two decode modes:
+1. "serial": Standard sequential draft → verify (default)
+2. "tree": EAGLE-style tree attention — drafts a tree of candidates,
+           verifies all branches in ONE target model forward pass
+
 Supports two target modes:
-1. "fp" mode: Draft=0.1-bit, Target=original FP model (for pre-Step2 benchmarking)
-2. "matryoshka" mode: Draft=0.1-bit, Target=0.1-bit+0.9-bit combined (post-Step2)
+1. "fp": Draft=0.1-bit, Target=original FP model (pre-Step2)
+2. "matryoshka": Draft=0.1-bit, Target=0.1+0.9-bit combined (post-Step2)
 
-Usage (FP target - before Step 2):
+Usage (serial, FP target):
     python speculative_decoding.py \
-        --base_model_id meta-llama/Llama-3.1-8B-Instruct \
-        --draft_model_path outputs/step1_draft_0.1bit/<timestamp> \
-        --target_mode fp \
-        --max_new_tokens 256 --draft_length 5
+        --draft_model_path outputs/step1_draft_0.1bit/<ts> \
+        --target_mode fp --decode_mode serial --draft_length 5
 
-Usage (Matryoshka target - after Step 2):
+Usage (tree, FP target):
     python speculative_decoding.py \
-        --base_model_id meta-llama/Llama-3.1-8B-Instruct \
-        --draft_model_path outputs/step1_draft_0.1bit/<timestamp> \
-        --residual_model_path outputs/step2_residual_0.9bit/<timestamp> \
-        --target_mode matryoshka \
-        --max_new_tokens 256 --draft_length 5
+        --draft_model_path outputs/step1_draft_0.1bit/<ts> \
+        --target_mode fp --decode_mode tree --tree_preset default
 """
 
 import argparse
@@ -36,6 +36,11 @@ from quantization.utils.quant_util import load_quantized_model
 from quantization.modules import LittleBitLinear
 from utils.datautils import load_tokenizer
 from utils.misc import setup_logger
+from tree_utils import (
+    generate_tree_buffers, generate_draft_tree,
+    evaluate_posterior, build_tree_attention_mask,
+    TREE_PRESETS,
+)
 
 logger = setup_logger(__name__)
 
@@ -445,6 +450,172 @@ def autoregressive_generate(
     return output_ids, stats
 
 
+def speculative_decode_tree(
+    draft_model: MatryoshkaDraftModel,
+    target_model,  # FPTargetModel or MatryoshkaTargetModel
+    input_ids: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    max_new_tokens: int = 256,
+    tree_buffers: dict = None,
+    top_k: int = 10,
+    temperature: float = 1.0,
+    greedy: bool = True,
+    eos_token_id: int = 2,
+    verbose: bool = False,
+):
+    """
+    Tree-based speculative decoding (EAGLE-style).
+    
+    Draft model generates a tree of candidates, target model verifies
+    ALL branches in one forward pass using tree attention mask.
+    """
+    device = input_ids.device
+    generated_tokens = []
+    total_draft_tokens = 0
+    total_accepted_tokens = 0
+    num_steps = 0
+    
+    tree_attn_mask = tree_buffers["tree_attn_mask"]  # (1,1,T,T)
+    tree_position_ids = tree_buffers["tree_position_ids"]  # (T,)
+    retrieve_indices = tree_buffers["retrieve_indices"]  # (num_leaves, max_depth+1)
+    tree_len = tree_buffers["tree_len"]
+    
+    current_ids = input_ids
+    current_mask = attention_mask
+    
+    start_time = time.time()
+    
+    while len(generated_tokens) < max_new_tokens:
+        num_steps += 1
+        
+        # === Draft Phase: Generate tree of candidates ===
+        tree_candidates = generate_draft_tree(
+            draft_model=draft_model,
+            input_ids=current_ids,
+            attention_mask=current_mask,
+            tree_buffers=tree_buffers,
+            top_k=top_k,
+            temperature=temperature,
+        )
+        # tree_candidates: (1, tree_len)
+        
+        # === Verification Phase: Run target on prefix + tree ===
+        prefix_len = current_ids.shape[1]
+        verify_ids = torch.cat([current_ids, tree_candidates[:, 1:]], dim=1)  # skip root (duplicate)
+        
+        # Build tree attention mask for the full sequence
+        full_attn_mask = build_tree_attention_mask(
+            prefix_len=prefix_len,
+            tree_attn_mask=tree_attn_mask,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        
+        # Adjust: we skip root in tree_candidates, so tree part is tree_len-1
+        actual_tree_len = tree_len - 1
+        actual_total = prefix_len + actual_tree_len
+        full_attn_mask_trimmed = full_attn_mask[:, :, :actual_total, :actual_total]
+        
+        # Position IDs: prefix uses sequential, tree uses prefix_len + tree_position_ids
+        prefix_position_ids = torch.arange(prefix_len, device=device).unsqueeze(0)
+        tree_pos = (prefix_len - 1) + tree_position_ids[1:]  # skip root
+        tree_pos = tree_pos.unsqueeze(0)
+        full_position_ids = torch.cat([prefix_position_ids, tree_pos], dim=1)
+        
+        # Target model forward — for FP models we pass attention_mask as 2D
+        # For tree attention we need 4D mask
+        target_logits = target_model.forward(
+            verify_ids,
+            full_attn_mask_trimmed,
+        )
+        # target_logits: (1, prefix_len + actual_tree_len, vocab)
+        
+        # Extract logits for tree nodes
+        tree_logits = target_logits[:, prefix_len - 1:, :]  # from last prefix pos onward
+        # tree_logits shape: (1, actual_tree_len + 1, vocab)
+        
+        # Build candidate paths using retrieve_indices
+        # Each row in retrieve_indices is a path from root to leaf
+        # Pad tree_candidates with -1 for out-of-range indices
+        padded_candidates = torch.cat([
+            tree_candidates,
+            torch.full((1, 1), -1, device=device, dtype=torch.long)
+        ], dim=1)
+        
+        cart_candidates = padded_candidates[0, retrieve_indices]  # (num_leaves, max_depth+1)
+        
+        # Get logits for each candidate path
+        padded_tree_logits = torch.cat([
+            tree_logits,
+            torch.zeros(1, 1, tree_logits.shape[-1], device=device, dtype=tree_logits.dtype)
+        ], dim=1)
+        
+        cart_logits = padded_tree_logits[0, retrieve_indices]  # (num_leaves, max_depth+1, vocab)
+        
+        # === Accept/Reject Phase ===
+        best_candidate, accept_length, next_token_logits = evaluate_posterior(
+            cart_logits, cart_candidates, greedy=greedy, temperature=temperature
+        )
+        
+        # Get accepted tokens
+        accepted_path = cart_candidates[best_candidate, 1:accept_length + 1]  # skip root
+        for t in accepted_path.tolist():
+            if t == -1:
+                break
+            generated_tokens.append(t)
+            if t == eos_token_id:
+                break
+        
+        # Get bonus token from next_token_logits
+        if len(generated_tokens) < max_new_tokens and (not generated_tokens or generated_tokens[-1] != eos_token_id):
+            if greedy:
+                if next_token_logits.dim() == 0:
+                    bonus_token = next_token_logits.item()
+                else:
+                    bonus_token = torch.argmax(next_token_logits).item()
+            else:
+                if next_token_logits.dim() > 1:
+                    next_token_logits = next_token_logits.squeeze()
+                probs = F.softmax(next_token_logits / max(temperature, 1e-8), dim=-1)
+                bonus_token = torch.multinomial(probs, 1).item()
+            generated_tokens.append(bonus_token)
+        
+        total_draft_tokens += actual_tree_len
+        total_accepted_tokens += accept_length
+        
+        if verbose:
+            logger.info(f"Step {num_steps}: tree_len={actual_tree_len}, accepted={accept_length}, "
+                       f"total generated={len(generated_tokens)}")
+        
+        # Update current sequence
+        all_gen = torch.tensor([generated_tokens], device=device, dtype=torch.long)
+        current_ids = torch.cat([input_ids, all_gen], dim=1)
+        if attention_mask is not None:
+            current_mask = torch.ones_like(current_ids)
+        
+        if generated_tokens[-1] == eos_token_id:
+            break
+    
+    end_time = time.time()
+    elapsed = end_time - start_time
+    
+    stats = {
+        "decode_mode": "tree",
+        "total_tokens_generated": len(generated_tokens),
+        "total_draft_tokens": total_draft_tokens,
+        "total_accepted_tokens": total_accepted_tokens,
+        "num_steps": num_steps,
+        "mean_acceptance_length": total_accepted_tokens / max(num_steps, 1),
+        "acceptance_rate": total_accepted_tokens / max(total_draft_tokens, 1),
+        "tokens_per_second": len(generated_tokens) / max(elapsed, 1e-6),
+        "elapsed_seconds": elapsed,
+        "tree_size": tree_len,
+    }
+    
+    output_ids = torch.cat([input_ids, torch.tensor([generated_tokens], device=device)], dim=1)
+    return output_ids, stats
+
+
 def load_target_model(args, device):
     """Load target model based on target_mode."""
     if args.target_mode == "fp":
@@ -475,12 +646,20 @@ def main():
     parser.add_argument("--target_mode", type=str, default="fp",
                         choices=["fp", "matryoshka"],
                         help="Target model type: 'fp'=original FP model, 'matryoshka'=0.1+0.9 combined")
+    parser.add_argument("--decode_mode", type=str, default="serial",
+                        choices=["serial", "tree"],
+                        help="Decode mode: 'serial'=sequential draft, 'tree'=EAGLE tree attention")
+    parser.add_argument("--tree_preset", type=str, default="default",
+                        choices=["small", "default", "large"],
+                        help="Tree structure preset (for tree mode)")
+    parser.add_argument("--top_k", type=int, default=10,
+                        help="Top-K for tree draft expansion (tree mode only)")
     parser.add_argument("--prompt", type=str, 
                         default="Write a Python function to compute fibonacci numbers efficiently.",
                         help="Input prompt for generation")
     parser.add_argument("--max_new_tokens", type=int, default=256)
     parser.add_argument("--draft_length", type=int, default=5,
-                        help="Number of draft tokens per speculative step (K)")
+                        help="Number of draft tokens per speculative step K (serial mode only)")
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--mode", type=str, default="greedy", choices=["greedy", "sampling"])
     parser.add_argument("--compare_baseline", type=str2bool, default=True,
@@ -506,6 +685,15 @@ def main():
     target_model = load_target_model(args, device)
     
     target_desc = "FP (original)" if args.target_mode == "fp" else "Matryoshka (0.1+0.9 bit)"
+    decode_desc = f"serial (K={args.draft_length})" if args.decode_mode == "serial" else f"tree ({args.tree_preset})"
+    
+    # Prepare tree buffers if tree mode
+    tree_buffers = None
+    if args.decode_mode == "tree":
+        tree_choices = TREE_PRESETS[args.tree_preset]
+        tree_buffers = generate_tree_buffers(tree_choices, device=str(device))
+        logger.info(f"Tree buffers generated: {tree_buffers['tree_len']} nodes, "
+                    f"{tree_buffers['retrieve_indices'].shape[0]} leaf paths")
     
     # Tokenize prompt
     chat_messages = [{"role": "user", "content": args.prompt}]
@@ -520,28 +708,43 @@ def main():
     
     # === Speculative Decoding ===
     logger.info(f"\n{'='*60}")
-    logger.info(f"Speculative Decoding (K={args.draft_length}, mode={args.mode})")
+    logger.info(f"Speculative Decoding ({decode_desc}, mode={args.mode})")
     logger.info(f"  Draft:  0.1-bit quantized")
     logger.info(f"  Target: {target_desc}")
     logger.info(f"{'='*60}")
     
-    output_ids, spec_stats = speculative_decode(
-        draft_model=draft_model,
-        target_model=target_model,
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        max_new_tokens=args.max_new_tokens,
-        draft_length=args.draft_length,
-        temperature=args.temperature,
-        greedy=greedy,
-        eos_token_id=eos_token_id,
-        verbose=True,
-    )
+    if args.decode_mode == "serial":
+        output_ids, spec_stats = speculative_decode(
+            draft_model=draft_model,
+            target_model=target_model,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=args.max_new_tokens,
+            draft_length=args.draft_length,
+            temperature=args.temperature,
+            greedy=greedy,
+            eos_token_id=eos_token_id,
+            verbose=True,
+        )
+    else:  # tree
+        output_ids, spec_stats = speculative_decode_tree(
+            draft_model=draft_model,
+            target_model=target_model,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=args.max_new_tokens,
+            tree_buffers=tree_buffers,
+            top_k=args.top_k,
+            temperature=args.temperature,
+            greedy=greedy,
+            eos_token_id=eos_token_id,
+            verbose=True,
+        )
     
     generated_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
     
     print(f"\n{'='*60}")
-    print(f"SPECULATIVE DECODING RESULTS")
+    print(f"SPECULATIVE DECODING RESULTS ({decode_desc})")
     print(f"  Draft:  0.1-bit | Target: {target_desc}")
     print(f"{'='*60}")
     print(f"Generated text:\n{generated_text}")
