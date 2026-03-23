@@ -59,58 +59,107 @@ def download_sharegpt(sharegpt_path=None):
 
     if sharegpt_path and os.path.exists(sharegpt_path):
         logger.info(f"Loading ShareGPT from local file: {sharegpt_path}")
+        # Support both .jsonl (one JSON per line) and .json (single JSON array)
         with open(sharegpt_path, "r", encoding="utf-8") as f:
-            for line in f:
-                try:
-                    item = json.loads(line.strip())
-                    if "conversations" in item:
-                        for turn in item["conversations"]:
-                            content = turn.get("value", turn.get("content", ""))
-                            if content:
-                                sharegpt_texts.append(content)
-                    elif "text" in item:
-                        sharegpt_texts.append(item["text"])
-                except json.JSONDecodeError:
-                    continue
+            first_char = f.read(1)
+            f.seek(0)
+            if first_char == '[':
+                # JSON array format
+                data = json.load(f)
+                for item in data:
+                    _extract_conversations(item, sharegpt_texts)
+            else:
+                # JSONL format
+                for line in f:
+                    try:
+                        item = json.loads(line.strip())
+                        _extract_conversations(item, sharegpt_texts)
+                    except json.JSONDecodeError:
+                        continue
         logger.info(f"  Loaded {len(sharegpt_texts)} conversation turns from local file")
     else:
-        logger.info("Downloading ShareGPT from HuggingFace (anon8231489123/ShareGPT_Vicuna_unfiltered)...")
+        logger.info("Downloading ShareGPT JSON files directly from HuggingFace...")
         try:
-            sharegpt_dataset = load_dataset(
-                "anon8231489123/ShareGPT_Vicuna_unfiltered",
-                "default",
-                split="train",
-            )
-            for item in sharegpt_dataset:
-                if "conversations" in item and item["conversations"]:
-                    for turn in item["conversations"]:
-                        content = turn.get("value", turn.get("content", ""))
-                        if content:
-                            sharegpt_texts.append(content)
-            logger.info(f"  ShareGPT loaded: {len(sharegpt_dataset)} conversations, {len(sharegpt_texts)} turns")
-        except Exception as e:
-            logger.warning(f"Failed to load ShareGPT from HuggingFace: {e}")
-            logger.warning("Falling back to alternative ShareGPT source...")
-            try:
-                sharegpt_dataset = load_dataset(
-                    "RyokoAI/ShareGPT52K",
-                    split="train",
-                )
-                for item in sharegpt_dataset:
-                    if "conversations" in item and item["conversations"]:
-                        for turn in item["conversations"]:
-                            content = turn.get("value", turn.get("content", ""))
-                            if content:
-                                sharegpt_texts.append(content)
-                logger.info(f"  ShareGPT (alt) loaded: {len(sharegpt_texts)} turns")
-            except Exception as e2:
-                logger.error(f"All ShareGPT sources failed: {e2}")
-                logger.error("Please provide a local ShareGPT file via --sharegpt_path")
-                return ""
+            from huggingface_hub import hf_hub_download
+        except ImportError:
+            logger.error("huggingface_hub not installed. pip install huggingface_hub")
+            return ""
+
+        # Try multiple sources in order
+        sources = [
+            {
+                "repo_id": "anon8231489123/ShareGPT_Vicuna_unfiltered",
+                "files": [
+                    "ShareGPT_V3_unfiltered_cleaned_split.json",
+                    "ShareGPT_V3_unfiltered_cleaned_split_no_imsorry.json",
+                ],
+                "repo_type": "dataset",
+            },
+            {
+                "repo_id": "RyokoAI/ShareGPT52K",
+                "files": [
+                    "old/sg_52k.json",
+                    "sg_90k_part1.json",
+                    "sg_90k_part2.json",
+                ],
+                "repo_type": "dataset",
+            },
+        ]
+
+        for source in sources:
+            if sharegpt_texts:
+                break
+            repo_id = source["repo_id"]
+            logger.info(f"  Trying source: {repo_id}")
+            for filename in source["files"]:
+                try:
+                    logger.info(f"    Downloading {filename}...")
+                    local_file = hf_hub_download(
+                        repo_id=repo_id,
+                        filename=filename,
+                        repo_type=source["repo_type"],
+                    )
+                    logger.info(f"    Parsing {filename}...")
+                    with open(local_file, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    
+                    count_before = len(sharegpt_texts)
+                    if isinstance(data, list):
+                        for item in data:
+                            _extract_conversations(item, sharegpt_texts)
+                    elif isinstance(data, dict):
+                        _extract_conversations(data, sharegpt_texts)
+                    
+                    count_added = len(sharegpt_texts) - count_before
+                    logger.info(f"    Extracted {count_added} turns from {filename}")
+                except Exception as e:
+                    logger.warning(f"    Failed to load {filename}: {e}")
+                    continue
+
+        if not sharegpt_texts:
+            logger.error("All ShareGPT sources failed.")
+            logger.error("Please provide a local ShareGPT file via --sharegpt_path")
+            return ""
 
     combined = "\n\n".join(sharegpt_texts)
-    logger.info(f"  ShareGPT total: {len(combined):,} characters")
+    logger.info(f"  ShareGPT total: {len(sharegpt_texts)} turns, {len(combined):,} characters")
     return combined
+
+
+def _extract_conversations(item, output_list):
+    """Extract conversation text from a ShareGPT item (various formats)."""
+    if not isinstance(item, dict):
+        return
+    
+    if "conversations" in item and isinstance(item["conversations"], list):
+        for turn in item["conversations"]:
+            if isinstance(turn, dict):
+                content = turn.get("value", turn.get("content", turn.get("text", "")))
+                if content and isinstance(content, str) and len(content.strip()) > 0:
+                    output_list.append(content.strip())
+    elif "text" in item and isinstance(item["text"], str):
+        if len(item["text"].strip()) > 0:
+            output_list.append(item["text"].strip())
 
 
 def tokenize_and_chunk(text, tokenizer, block_size=2048):

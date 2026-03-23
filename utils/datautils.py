@@ -113,6 +113,21 @@ def get_qat_dataset(name, tokenizer, sharegpt_path=None):
     return data
 
 
+def _extract_sharegpt_turns(item, output_list):
+    """Extract conversation text from a ShareGPT item (various formats)."""
+    if not isinstance(item, dict):
+        return
+    if "conversations" in item and isinstance(item["conversations"], list):
+        for turn in item["conversations"]:
+            if isinstance(turn, dict):
+                content = turn.get("value", turn.get("content", turn.get("text", "")))
+                if content and isinstance(content, str) and len(content.strip()) > 0:
+                    output_list.append(content.strip())
+    elif "text" in item and isinstance(item["text"], str):
+        if len(item["text"].strip()) > 0:
+            output_list.append(item["text"].strip())
+
+
 def get_wikitext2_sharegpt_train(tokenizer, sharegpt_path=None, seed=0, seqlen=2048):
     """Mixed wikitext2 + ShareGPT dataset for QAT training."""
     # --- Part 1: Wikitext2 ---
@@ -125,33 +140,49 @@ def get_wikitext2_sharegpt_train(tokenizer, sharegpt_path=None, seed=0, seqlen=2
         import json as _json
         logger.info(f"Loading ShareGPT data from local path: {sharegpt_path}")
         with open(sharegpt_path, "r", encoding="utf-8") as f:
-            for line in f:
-                try:
-                    item = _json.loads(line.strip())
-                    # Support various ShareGPT formats
-                    if "conversations" in item:
-                        for turn in item["conversations"]:
-                            content = turn.get("value", turn.get("content", ""))
-                            if content:
-                                sharegpt_texts.append(content)
-                    elif "text" in item:
-                        sharegpt_texts.append(item["text"])
-                except _json.JSONDecodeError:
-                    continue
+            first_char = f.read(1)
+            f.seek(0)
+            if first_char == '[':
+                data = _json.load(f)
+                for item in data:
+                    _extract_sharegpt_turns(item, sharegpt_texts)
+            else:
+                for line in f:
+                    try:
+                        item = _json.loads(line.strip())
+                        _extract_sharegpt_turns(item, sharegpt_texts)
+                    except _json.JSONDecodeError:
+                        continue
     else:
-        logger.info("Loading ShareGPT from HuggingFace: anon8231489123/ShareGPT_Vicuna_unfiltered")
+        logger.info("Downloading ShareGPT JSON directly from HuggingFace...")
         try:
-            sharegpt_dataset = load_dataset(
-                "anon8231489123/ShareGPT_Vicuna_unfiltered",
-                "default",
-                split="train",
-            )
-            for item in sharegpt_dataset:
-                if "conversations" in item and item["conversations"]:
-                    for turn in item["conversations"]:
-                        content = turn.get("value", turn.get("content", ""))
-                        if content:
-                            sharegpt_texts.append(content)
+            import json as _json
+            from huggingface_hub import hf_hub_download
+            sources = [
+                ("anon8231489123/ShareGPT_Vicuna_unfiltered", [
+                    "ShareGPT_V3_unfiltered_cleaned_split.json",
+                    "ShareGPT_V3_unfiltered_cleaned_split_no_imsorry.json",
+                ]),
+                ("RyokoAI/ShareGPT52K", [
+                    "old/sg_52k.json",
+                ]),
+            ]
+            for repo_id, files in sources:
+                if sharegpt_texts:
+                    break
+                for fname in files:
+                    try:
+                        local_file = hf_hub_download(repo_id=repo_id, filename=fname, repo_type="dataset")
+                        with open(local_file, "r", encoding="utf-8") as f:
+                            data = _json.load(f)
+                        if isinstance(data, list):
+                            for item in data:
+                                _extract_sharegpt_turns(item, sharegpt_texts)
+                        logger.info(f"ShareGPT loaded from {repo_id}/{fname}: {len(sharegpt_texts)} turns")
+                        break
+                    except Exception as e:
+                        logger.warning(f"Failed {repo_id}/{fname}: {e}")
+                        continue
         except Exception as e:
             logger.warning(f"Failed to load ShareGPT from HuggingFace: {e}. Using wikitext2 only.")
 
