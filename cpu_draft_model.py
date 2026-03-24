@@ -238,16 +238,23 @@ class CPUDraftModel:
             self._cached_seq_len = 0
     
     @torch.no_grad()
-    def _forward_token(self, token_id: int) -> torch.Tensor:
+    def _forward_token(self, token_id: int, profile: bool = False) -> torch.Tensor:
         """Process a single token through the transformer, updating KV cache.
         Uses C++ ops for RMSNorm and SiLU where available.
         Returns the hidden state (1, hidden_size).
+        If profile=True, logs time breakdown.
         """
+        import time
         self._ensure_cache()
         
+        if profile:
+            t_embed = 0; t_rms = 0; t_lb = 0; t_attn = 0; t_silu = 0; t_lm = 0
+        
         # Embedding lookup (C++ op)
+        t0 = time.perf_counter() if profile else 0
         hidden = self._embed(torch.tensor([token_id], dtype=torch.long))
         hidden = hidden.reshape(1, self.config.hidden_size)
+        if profile: t_embed += time.perf_counter() - t0
         
         # Run through all layers using C++ RMSNorm and SiLU
         from littlebit_kernels_cpu.runtime import littlebit_linear as lb_linear_fn
@@ -261,15 +268,20 @@ class CPUDraftModel:
         for layer, layer_cache in zip(self.lb_model.layers, self._cache):
             residual = x
             
-            # RMSNorm (C++ op)
+            # RMSNorm
+            t0 = time.perf_counter() if profile else 0
             normed = _cpp_rms_norm(x, layer.input_layernorm_weight, eps)
+            if profile: t_rms += time.perf_counter() - t0
             
-            # Q, K, V projections (LittleBit kernel)
+            # Q, K, V, O projections (LittleBit kernel)
+            t0 = time.perf_counter() if profile else 0
             q = lb_linear_fn(normed, layer.q_proj).to(torch.float32)
             k = lb_linear_fn(normed, layer.k_proj).to(torch.float32)
             v = lb_linear_fn(normed, layer.v_proj).to(torch.float32)
+            if profile: t_lb += time.perf_counter() - t0
             
             # Attention with KV cache
+            t0 = time.perf_counter() if profile else 0
             q_grouped = _group_query_heads(
                 q,
                 num_key_value_heads=self.config.num_key_value_heads,
@@ -286,24 +298,50 @@ class CPUDraftModel:
                 q_grouped, keys, values,
                 attn_scale=self.lb_model.attn_scale,
             )
+            if profile: t_attn += time.perf_counter() - t0
             
+            t0 = time.perf_counter() if profile else 0
             x = residual + lb_linear_fn(attn_out, layer.o_proj).to(torch.float32)
+            if profile: t_lb += time.perf_counter() - t0
             
             # MLP
             residual = x
+            t0 = time.perf_counter() if profile else 0
             mlp_in = _cpp_rms_norm(x, layer.post_attention_layernorm_weight, eps)
+            if profile: t_rms += time.perf_counter() - t0
+            
+            t0 = time.perf_counter() if profile else 0
             gate = lb_linear_fn(mlp_in, layer.gate_proj).to(torch.float32)
             up = lb_linear_fn(mlp_in, layer.up_proj).to(torch.float32)
+            if profile: t_lb += time.perf_counter() - t0
             
-            # Fused SiLU * up (C++ op)
+            t0 = time.perf_counter() if profile else 0
             mlp_hidden = _cpp_silu_mul(gate, up)
+            if profile: t_silu += time.perf_counter() - t0
+            
+            t0 = time.perf_counter() if profile else 0
             x = residual + lb_linear_fn(mlp_hidden, layer.down_proj).to(torch.float32)
+            if profile: t_lb += time.perf_counter() - t0
         
         # Final RMSNorm (C++ op)
+        t0 = time.perf_counter() if profile else 0
         final_hidden = _cpp_rms_norm(x, self.lb_model.final_norm_weight, eps)
+        if profile: t_rms += time.perf_counter() - t0
         
         self._cache_pos += 1
         self._last_hidden = final_hidden
+        
+        if profile:
+            total = t_embed + t_rms + t_lb + t_attn + t_silu
+            logger.info(
+                f"Token profile: total={total*1000:.0f}ms | "
+                f"LB_linear={t_lb*1000:.0f}ms({t_lb/total*100:.0f}%) | "
+                f"RMSNorm={t_rms*1000:.0f}ms({t_rms/total*100:.0f}%) | "
+                f"Attn={t_attn*1000:.0f}ms({t_attn/total*100:.0f}%) | "
+                f"SiLU={t_silu*1000:.0f}ms({t_silu/total*100:.0f}%) | "
+                f"Embed={t_embed*1000:.1f}ms"
+            )
+        
         return final_hidden
     
     @torch.no_grad()

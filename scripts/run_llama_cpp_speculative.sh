@@ -157,32 +157,41 @@ model = CPUDraftModel(
     base_model_id='${FP_MODEL_DIR}',
 )
 
-# Warmup: prefill 1 token + generate 1
-print('Warmup...', flush=True)
-dummy = torch.tensor([[128000]], dtype=torch.long)
-t0 = time.time()
-model.generate_draft_tokens(dummy, draft_length=1, greedy=True)
-print(f'Warmup done in {time.time()-t0:.2f}s', flush=True)
+# === PROFILE: 3 tokens with per-op breakdown ===
+print('=== Per-operation profiling (3 tokens) ===', flush=True)
+model.reset()
+model._ensure_cache()
+# Token 1 with profiling
+model._forward_token(128000, profile=True)
+# lm_head profiling
+t0 = time.perf_counter()
+logits = model._lm_head(model._last_hidden)
+t_lm = time.perf_counter() - t0
+print(f'  lm_head: {t_lm*1000:.0f}ms', flush=True)
+tok = torch.argmax(logits, dim=-1).item()
+# Token 2
+model._forward_token(tok, profile=True)
+logits = model._lm_head(model._last_hidden)
+tok = torch.argmax(logits, dim=-1).item()
+# Token 3
+model._forward_token(tok, profile=True)
+print('', flush=True)
 
-# Benchmark: generate ${GEN_TOKENS} tokens autoregressively with KV cache
+# === BENCHMARK: ${GEN_TOKENS} tokens ===
 print(f'Benchmark: generating ${GEN_TOKENS} tokens (with KV cache)...', flush=True)
 model.reset()
 input_ids = torch.tensor([[128000]], dtype=torch.long)
-
-# Prefill the initial token
 model.prefill(input_ids)
 
 start = time.time()
 tokens = []
 for i in range(${GEN_TOKENS}):
     t1 = time.time()
-    # Generate 1 draft token (uses cached KV, only 1 forward pass)
     draft_tokens, _ = model.generate_draft_tokens(
         input_ids, draft_length=1, greedy=True
     )
     tok = draft_tokens[0].reshape(-1)[0].item()
     tokens.append(tok)
-    # Extend input_ids with the new token
     next_id = torch.tensor([[tok]], dtype=torch.long)
     input_ids = torch.cat([input_ids, next_id], dim=1)
     dt = time.time() - t1
