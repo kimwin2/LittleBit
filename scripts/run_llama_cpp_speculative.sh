@@ -103,10 +103,17 @@ else
         --format runtime
 fi
 
-# Build CPU extension (force rebuild for latest kernel changes)
-echo "Building CPU extension (fresh build)..."
+# Build CPU extension with optimized kernel
+echo "Building CPU extension (optimized kernel)..."
+
+# Copy optimized kernel over the original (lb_kernels is a submodule, can't push there)
+if [ -f "patches/littlebit_cpu_optimized.cpp" ]; then
+    echo "Applying optimized kernel from patches/..."
+    cp patches/littlebit_cpu_optimized.cpp lb_kernels/littlebit_kernels_cpu/littlebit_cpu.cpp
+fi
+
 cd lb_kernels/littlebit_kernels_cpu
-rm -rf build/       # Force rebuild — build dir used by runtime.py
+rm -rf build/       # Force rebuild
 python setup.py build_ext --inplace
 cd ../..
 
