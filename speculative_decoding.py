@@ -293,7 +293,7 @@ def speculative_decode(
         )
         
         # Build verification sequence: original + K draft tokens
-        draft_token_ids = torch.cat(draft_tokens, dim=1)  # (1, K)
+        draft_token_ids = torch.cat(draft_tokens, dim=1).to(device)  # (1, K) — ensure same device as target
         verify_ids = torch.cat([current_ids, draft_token_ids], dim=1)  # (1, seq_len + K)
         if current_mask is not None:
             verify_mask = torch.cat([
@@ -329,7 +329,7 @@ def speculative_decode(
                     break
             else:
                 target_prob_i = F.softmax(target_logit_i / max(temperature, 1e-8), dim=-1)
-                draft_prob_i = draft_probs[i]
+                draft_prob_i = draft_probs[i].to(device) if hasattr(draft_probs[i], 'to') else draft_probs[i]
                 
                 token_idx = draft_token_i.item()
                 p_target = target_prob_i[0, token_idx].item()
