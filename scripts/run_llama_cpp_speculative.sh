@@ -161,9 +161,10 @@ for i in range(${GEN_TOKENS}):
     draft_tokens, _ = model.generate_draft_tokens(
         input_ids, draft_length=1, greedy=True
     )
-    tok = draft_tokens[0].item()
+    tok = draft_tokens[0].reshape(-1)[0].item()
     tokens.append(tok)
-    input_ids = torch.cat([input_ids, draft_tokens[0].unsqueeze(0)], dim=1)
+    next_id = torch.tensor([[tok]], dtype=torch.long)
+    input_ids = torch.cat([input_ids, next_id], dim=1)
 
 elapsed = time.time() - start
 tps = ${GEN_TOKENS} / elapsed
