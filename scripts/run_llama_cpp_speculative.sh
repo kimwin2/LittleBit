@@ -103,10 +103,11 @@ else
         --format runtime
 fi
 
-# Build CPU extension
-echo "Building CPU extension..."
+# Build CPU extension (force rebuild for latest kernel changes)
+echo "Building CPU extension (fresh build)..."
 cd lb_kernels/littlebit_kernels_cpu
-python setup.py build_ext --inplace 2>/dev/null || echo "Already built"
+rm -rf _build_*    # Force rebuild with optimized kernel
+python setup.py build_ext --inplace 2>/dev/null || python setup.py build_ext --inplace
 cd ../..
 
 # ===========================
