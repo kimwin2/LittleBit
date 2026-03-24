@@ -150,14 +150,19 @@ model = CPUDraftModel(
 )
 
 # Warmup
+print('Warmup: generating 1 token...', flush=True)
 dummy = torch.tensor([[128000]], dtype=torch.long)
+t0 = time.time()
 model.generate_draft_tokens(dummy, draft_length=1, greedy=True)
+print(f'Warmup done in {time.time()-t0:.2f}s', flush=True)
 
 # Benchmark: generate ${GEN_TOKENS} tokens autoregressively
+print(f'Benchmark: generating ${GEN_TOKENS} tokens...', flush=True)
 input_ids = torch.tensor([[128000]], dtype=torch.long)
 start = time.time()
 tokens = []
 for i in range(${GEN_TOKENS}):
+    t1 = time.time()
     draft_tokens, _ = model.generate_draft_tokens(
         input_ids, draft_length=1, greedy=True
     )
@@ -165,10 +170,19 @@ for i in range(${GEN_TOKENS}):
     tokens.append(tok)
     next_id = torch.tensor([[tok]], dtype=torch.long)
     input_ids = torch.cat([input_ids, next_id], dim=1)
+    dt = time.time() - t1
+    if (i+1) % 5 == 0 or i == 0:
+        elapsed_so_far = time.time() - start
+        tps_so_far = (i+1) / elapsed_so_far
+        print(f'  Token {i+1}/${GEN_TOKENS}: {dt:.2f}s/tok, avg {tps_so_far:.2f} t/s (prefix={input_ids.shape[1]})', flush=True)
 
 elapsed = time.time() - start
 tps = ${GEN_TOKENS} / elapsed
-print(f'Draft CPU kernel: {tps:.2f} t/s ({elapsed:.2f}s for ${GEN_TOKENS} tokens)')
+print(f'')
+print(f'=== Draft CPU kernel result ===')
+print(f'  Tokens: ${GEN_TOKENS}')
+print(f'  Time:   {elapsed:.2f}s')
+print(f'  Speed:  {tps:.2f} t/s')
 "
 
 # ===========================
