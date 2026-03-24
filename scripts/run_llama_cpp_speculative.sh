@@ -1,18 +1,16 @@
 #!/bin/bash
 # ==============================================================================
-# Full Pipeline: Build llama.cpp + Convert + Run CPU Speculative Decoding
+# CPU Speculative Decoding Benchmark
 # ==============================================================================
 #
-# This script:
-#   1. Builds llama.cpp for CPU
-#   2. Converts FP16 target model to GGUF (F16)
-#   3. Converts 0.1-bit draft runtime checkpoint to LittleBit GGUF
-#   4. Runs speculative decoding benchmark via llama-speculative-simple
+# Measures:
+#   1. FP16 target baseline speed via llama.cpp (autoregressive, CPU)
+#   2. 0.1-bit draft speed via Python CPU kernel (autoregressive, CPU)
+#   3. All-CPU speculative decoding (draft=CPU kernel, target=PyTorch CPU)
 #
-# Prerequisites:
-#   - cmake, ninja (or make), gcc/g++
-#   - Python with safetensors, torch, transformers
-#   - Converted runtime checkpoint (from convert_hf_to_runtime.py)
+# The lb_kernels llama.cpp fork is NOT available, so we use:
+#   - llama.cpp (upstream) for FP16 target speed measurement
+#   - Python CPU kernel for draft speed + speculative decoding
 # ==============================================================================
 
 set -e
@@ -24,13 +22,15 @@ set -e
 # Base FP16 model (HuggingFace format)
 FP_MODEL_DIR="/group-volume/ym1012.kim/homepc/EAGLE/Llama-3.1-8B-Instruct"
 
+# HF checkpoint (original trained output)
+HF_CKPT_DIR="/group-volume/ym1012.kim/homepc/LittleSpec/outputs/step1_draft_0.1bit/2026_03_23_13_29"
+
 # Runtime checkpoint (from convert_hf_to_runtime.py)
 RUNTIME_CKPT_DIR="/group-volume/ym1012.kim/homepc/LittleSpec/outputs/step1_draft_0.1bit/2026_03_23_13_29_runtime"
 
-# Output GGUF files
+# GGUF for llama.cpp FP16 baseline
 GGUF_DIR="/group-volume/ym1012.kim/homepc/LittleSpec/gguf_models"
 FP_GGUF="${GGUF_DIR}/llama3.1-8b-instruct-f16.gguf"
-DRAFT_GGUF="${GGUF_DIR}/llama3.1-8b-instruct-littlebit-0.1bit.gguf"
 
 # llama.cpp paths
 LLAMA_CPP_DIR="lb_kernels/llama.cpp"
@@ -40,44 +40,34 @@ LLAMA_BUILD_DIR="${LLAMA_CPP_DIR}/build-cpu"
 THREADS=4
 CTX=512
 GEN_TOKENS=64
-DRAFT_MAX=8
 PROMPT="Write a Python function to compute fibonacci numbers efficiently."
 
+# SD settings
+DRAFT_LENGTHS="4"
+MAX_SAMPLES=5
+MAX_NEW_TOKENS=64
+
 # ===========================
-# STEP 1: Build llama.cpp for CPU
+# STEP 1: Build llama.cpp for CPU (if not already built)
 # ===========================
 
 echo "============================================================"
 echo "STEP 1: Building llama.cpp for CPU"
 echo "============================================================"
 
-if [ -f "${LLAMA_BUILD_DIR}/bin/llama-speculative-simple" ]; then
+LLAMA_CLI="${LLAMA_BUILD_DIR}/bin/llama-cli"
+if [ -f "${LLAMA_CLI}" ]; then
     echo "llama.cpp already built. Skipping."
 else
     mkdir -p "${LLAMA_BUILD_DIR}"
     cd "${LLAMA_BUILD_DIR}"
     cmake .. -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON
-    cmake --build . -j$(nproc) --target llama-cli llama-speculative-simple
+    cmake --build . -j$(nproc) --target llama-cli
     cd ../../..
-    echo "llama.cpp build complete!"
 fi
-
-# Verify binaries
-LLAMA_CLI="${LLAMA_BUILD_DIR}/bin/llama-cli"
-LLAMA_SPEC="${LLAMA_BUILD_DIR}/bin/llama-speculative-simple"
-
-if [ ! -f "${LLAMA_CLI}" ]; then
-    echo "ERROR: llama-cli not found at ${LLAMA_CLI}"
-    exit 1
-fi
-if [ ! -f "${LLAMA_SPEC}" ]; then
-    echo "ERROR: llama-speculative-simple not found at ${LLAMA_SPEC}"
-    exit 1
-fi
-echo "Binaries OK: ${LLAMA_CLI}, ${LLAMA_SPEC}"
 
 # ===========================
-# STEP 2: Convert FP16 model to GGUF
+# STEP 2: Convert FP16 to GGUF (if not already done)
 # ===========================
 
 echo ""
@@ -86,7 +76,6 @@ echo "STEP 2: Converting FP16 model to GGUF"
 echo "============================================================"
 
 mkdir -p "${GGUF_DIR}"
-
 if [ -f "${FP_GGUF}" ]; then
     echo "FP16 GGUF already exists. Skipping."
 else
@@ -94,54 +83,41 @@ else
         ${FP_MODEL_DIR} \
         --outfile ${FP_GGUF} \
         --outtype f16
-    echo "FP16 GGUF saved to ${FP_GGUF}"
 fi
 
 # ===========================
-# STEP 3: Convert LittleBit draft to GGUF
+# STEP 3: Convert HF to runtime (if not already done)
 # ===========================
 
 echo ""
 echo "============================================================"
-echo "STEP 3: Converting LittleBit draft to GGUF"
+echo "STEP 3: Converting draft to runtime format"
 echo "============================================================"
 
-# HF checkpoint (original trained output)
-HF_CKPT_DIR="/group-volume/ym1012.kim/homepc/LittleSpec/outputs/step1_draft_0.1bit/2026_03_23_13_29"
-CANONICAL_DIR="${GGUF_DIR}/canonical_tmp"
-
-if [ -f "${DRAFT_GGUF}" ]; then
-    echo "Draft GGUF already exists. Skipping."
+if [ -d "${RUNTIME_CKPT_DIR}" ]; then
+    echo "Runtime checkpoint already exists. Skipping."
 else
-    # Step 3a: Convert HF → canonical format (u_sign_packed keys)
-    echo "Converting HF checkpoint to canonical format..."
     python convert_hf_to_runtime.py \
         --input_path ${HF_CKPT_DIR} \
-        --output_path ${CANONICAL_DIR} \
-        --format canonical
-
-    # Step 3b: Convert canonical → GGUF
-    echo "Converting canonical to GGUF..."
-    python lb_kernels/tools/convert_littlebit_hf_to_gguf.py \
-        --input_dir ${CANONICAL_DIR} \
-        --output_file ${DRAFT_GGUF} \
-        --outtype f16
-    echo "Draft GGUF saved to ${DRAFT_GGUF}"
+        --output_path ${RUNTIME_CKPT_DIR} \
+        --format runtime
 fi
 
+# Build CPU extension
+echo "Building CPU extension..."
+cd lb_kernels/littlebit_kernels_cpu
+python setup.py build_ext --inplace 2>/dev/null || echo "Already built"
+cd ../..
+
 # ===========================
-# STEP 4: Run baselines
+# STEP 4: FP16 Target Baseline (llama.cpp)
 # ===========================
 
 echo ""
 echo "============================================================"
-echo "STEP 4: Running benchmarks"
+echo "STEP 4: FP16 Target Baseline (llama.cpp, CPU)"
 echo "============================================================"
 
-export LLAMA_LITTLEBIT_CPU_FUSED=1
-
-echo ""
-echo "--- FP16 Target baseline (autoregressive) ---"
 ${LLAMA_CLI} \
     -m ${FP_GGUF} \
     -ngl 0 \
@@ -154,41 +130,67 @@ ${LLAMA_CLI} \
     --ignore-eos \
     -st --simple-io
 
-echo ""
-echo "--- Draft 0.1-bit baseline (autoregressive) ---"
-${LLAMA_CLI} \
-    -m ${DRAFT_GGUF} \
-    -ngl 0 \
-    -t ${THREADS} \
-    -c ${CTX} \
-    -n ${GEN_TOKENS} \
-    -p "${PROMPT}" \
-    -s 0 \
-    --temp 0 --top-k 1 \
-    --ignore-eos \
-    -st --simple-io
-
 # ===========================
-# STEP 5: Run speculative decoding
+# STEP 5: Draft Speed Benchmark (Python CPU kernel)
 # ===========================
 
 echo ""
-echo "--- Speculative Decoding (draft=0.1bit, target=FP16) ---"
-${LLAMA_SPEC} \
-    -m ${FP_GGUF} \
-    -md ${DRAFT_GGUF} \
-    -ngl 0 \
-    -t ${THREADS} \
-    -c ${CTX} \
-    -cd ${CTX} \
-    -n ${GEN_TOKENS} \
-    -p "${PROMPT}" \
-    -s 0 \
-    --temp 0 --top-k 1 \
-    --ignore-eos \
-    --draft-max ${DRAFT_MAX} \
-    --draft-min 0 \
-    --draft-p-min 0.0
+echo "============================================================"
+echo "STEP 5: 0.1-bit Draft Speed Benchmark (CPU kernel)"
+echo "============================================================"
+
+python -c "
+import time, sys, torch
+sys.path.insert(0, 'lb_kernels')
+from cpu_draft_model import CPUDraftModel
+
+model = CPUDraftModel(
+    runtime_path='${RUNTIME_CKPT_DIR}',
+    base_model_id='${FP_MODEL_DIR}',
+)
+
+# Warmup
+dummy = torch.tensor([[128000]], dtype=torch.long)
+model.generate_draft_tokens(dummy, draft_length=1, greedy=True)
+
+# Benchmark: generate ${GEN_TOKENS} tokens autoregressively
+input_ids = torch.tensor([[128000]], dtype=torch.long)
+start = time.time()
+tokens = []
+for i in range(${GEN_TOKENS}):
+    draft_tokens, _ = model.generate_draft_tokens(
+        input_ids, draft_length=1, greedy=True
+    )
+    tok = draft_tokens[0].item()
+    tokens.append(tok)
+    input_ids = torch.cat([input_ids, draft_tokens[0].unsqueeze(0)], dim=1)
+
+elapsed = time.time() - start
+tps = ${GEN_TOKENS} / elapsed
+print(f'Draft CPU kernel: {tps:.2f} t/s ({elapsed:.2f}s for ${GEN_TOKENS} tokens)')
+"
+
+# ===========================
+# STEP 6: All-CPU Speculative Decoding
+# ===========================
+
+echo ""
+echo "============================================================"
+echo "STEP 6: All-CPU Speculative Decoding (draft=CPU kernel, target=PyTorch FP)"
+echo "============================================================"
+
+python eval_speculative.py \
+    --base_model_id ${FP_MODEL_DIR} \
+    --draft_model_path ${RUNTIME_CKPT_DIR} \
+    --target_mode fp \
+    --draft_device cpu_kernel \
+    --benchmark mt_bench \
+    --max_samples ${MAX_SAMPLES} \
+    --max_new_tokens ${MAX_NEW_TOKENS} \
+    --draft_lengths ${DRAFT_LENGTHS} \
+    --mode greedy \
+    --output_file eval_results/speculative_all_cpu_eval.json \
+    --device cpu
 
 echo ""
 echo "============================================================"
