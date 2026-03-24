@@ -149,32 +149,39 @@ model = CPUDraftModel(
     base_model_id='${FP_MODEL_DIR}',
 )
 
-# Warmup
-print('Warmup: generating 1 token...', flush=True)
+# Warmup: prefill 1 token + generate 1
+print('Warmup...', flush=True)
 dummy = torch.tensor([[128000]], dtype=torch.long)
 t0 = time.time()
 model.generate_draft_tokens(dummy, draft_length=1, greedy=True)
 print(f'Warmup done in {time.time()-t0:.2f}s', flush=True)
 
-# Benchmark: generate ${GEN_TOKENS} tokens autoregressively
-print(f'Benchmark: generating ${GEN_TOKENS} tokens...', flush=True)
+# Benchmark: generate ${GEN_TOKENS} tokens autoregressively with KV cache
+print(f'Benchmark: generating ${GEN_TOKENS} tokens (with KV cache)...', flush=True)
+model.reset()
 input_ids = torch.tensor([[128000]], dtype=torch.long)
+
+# Prefill the initial token
+model.prefill(input_ids)
+
 start = time.time()
 tokens = []
 for i in range(${GEN_TOKENS}):
     t1 = time.time()
+    # Generate 1 draft token (uses cached KV, only 1 forward pass)
     draft_tokens, _ = model.generate_draft_tokens(
         input_ids, draft_length=1, greedy=True
     )
     tok = draft_tokens[0].reshape(-1)[0].item()
     tokens.append(tok)
+    # Extend input_ids with the new token
     next_id = torch.tensor([[tok]], dtype=torch.long)
     input_ids = torch.cat([input_ids, next_id], dim=1)
     dt = time.time() - t1
-    if (i+1) % 5 == 0 or i == 0:
+    if (i+1) % 10 == 0 or i == 0:
         elapsed_so_far = time.time() - start
         tps_so_far = (i+1) / elapsed_so_far
-        print(f'  Token {i+1}/${GEN_TOKENS}: {dt:.2f}s/tok, avg {tps_so_far:.2f} t/s (prefix={input_ids.shape[1]})', flush=True)
+        print(f'  Token {i+1}/${GEN_TOKENS}: {dt:.3f}s/tok, avg {tps_so_far:.2f} t/s', flush=True)
 
 elapsed = time.time() - start
 tps = ${GEN_TOKENS} / elapsed

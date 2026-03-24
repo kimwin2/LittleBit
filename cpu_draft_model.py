@@ -4,6 +4,11 @@ CPU Kernel Draft Model for Speculative Decoding.
 Wraps lb_kernels/littlebit_kernels_cpu's DummyLlama3LittleBitModel
 to provide the same interface as MatryoshkaDraftModel.
 
+Key design: Persistent KV cache for incremental token generation.
+- prefill() processes the initial prompt once
+- generate_draft_tokens() only processes NEW tokens incrementally
+- reset() clears KV cache when the prompt changes
+
 Usage:
     from cpu_draft_model import CPUDraftModel
     model = CPUDraftModel(runtime_path, base_model_id)
@@ -41,13 +46,7 @@ logger = setup_logger(__name__)
 class CPUDraftModel:
     """CPU kernel-based draft model for speculative decoding.
     
-    Loads a converted runtime checkpoint and runs inference
-    using the optimized CPU LittleBit kernel.
-    
-    The model handles:
-    - Embedding lookup (dense, from base model)
-    - Transformer layers (LittleBit CPU kernel)
-    - LM head projection (dense, from base model)
+    Uses persistent KV cache for efficient incremental generation.
     """
     
     def __init__(
@@ -108,10 +107,21 @@ class CPUDraftModel:
         self.config = config
         self.device = torch.device("cpu")
         self.max_seq_len = 4096
+        
+        # Persistent KV cache
         self._cache = None
-        self._cache_position = 0
+        self._cache_pos = 0        # Next position to write in cache
+        self._cached_seq_len = 0   # How many input tokens have been cached
+        self._last_hidden = None   # Last hidden state from transformer
         
         logger.info("CPU draft model ready")
+    
+    def reset(self):
+        """Reset KV cache. Call when prompt changes."""
+        self._cache = None
+        self._cache_pos = 0
+        self._cached_seq_len = 0
+        self._last_hidden = None
     
     def _embed(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Lookup embeddings."""
@@ -121,17 +131,53 @@ class CPUDraftModel:
         """Project hidden state to logits."""
         return F.linear(hidden.to(torch.float32), self.lm_head_weight)
     
-    @torch.no_grad()
-    def forward_single_token(self, hidden: torch.Tensor, position: int):
-        """Forward pass for a single token through the transformer + lm_head."""
+    def _ensure_cache(self):
+        """Allocate KV cache if not yet allocated."""
         if self._cache is None:
             self._cache = self.lb_model.allocate_cache(self.max_seq_len)
-        
+            self._cache_pos = 0
+            self._cached_seq_len = 0
+    
+    @torch.no_grad()
+    def _forward_token(self, token_id: int) -> torch.Tensor:
+        """Process a single token through the transformer, updating KV cache.
+        Returns the hidden state (1, hidden_size).
+        """
+        self._ensure_cache()
+        hidden = self._embed(torch.tensor([[token_id]]))  # (1, 1, hidden_size)
+        hidden = hidden.squeeze(0)  # (1, hidden_size)
         output = self.lb_model.forward_token(
-            hidden, self._cache, position, compute_logits=False
+            hidden, self._cache, self._cache_pos, compute_logits=False
         )
-        logits = self._lm_head(output.hidden)
-        return logits
+        self._cache_pos += 1
+        self._last_hidden = output.hidden
+        return output.hidden
+    
+    @torch.no_grad()
+    def prefill(self, input_ids: torch.Tensor):
+        """Process input tokens and cache KV states. 
+        Only processes tokens not yet cached.
+        """
+        input_ids = input_ids.to("cpu")
+        seq_len = input_ids.shape[1]
+        
+        # If we already cached some prefix and input extends it, only process new tokens
+        if self._cached_seq_len > 0 and seq_len > self._cached_seq_len:
+            start = self._cached_seq_len
+        elif self._cached_seq_len == 0:
+            start = 0
+        else:
+            # seq_len <= cached: prompt changed, need full reset
+            self.reset()
+            start = 0
+        
+        self._ensure_cache()
+        
+        for pos in range(start, seq_len):
+            token_id = input_ids[0, pos].item()
+            self._forward_token(token_id)
+        
+        self._cached_seq_len = seq_len
     
     @torch.no_grad()
     def generate_draft_tokens(
@@ -144,32 +190,31 @@ class CPUDraftModel:
     ):
         """Generate K draft tokens autoregressively using CPU kernel.
         
-        Note: This processes the ENTIRE prefix first (no KV cache reuse
-        across calls), then generates K draft tokens.
+        Uses persistent KV cache — only processes new tokens in input_ids
+        that haven't been cached yet, then generates K draft tokens.
+        The K draft positions are rolled back after generation so the
+        cache stays at the prefix boundary for the next call.
         """
         input_ids = input_ids.to("cpu")
         seq_len = input_ids.shape[1]
         
-        # Reset cache
-        self._cache = self.lb_model.allocate_cache(self.max_seq_len)
+        # Check if prompt changed (different prefix)
+        if self._cached_seq_len > seq_len:
+            self.reset()
         
-        # Process prefix: run each token through the model
-        for pos in range(seq_len):
-            token_id = input_ids[0, pos].item()
-            hidden = self._embed(torch.tensor([[token_id]]))  # (1, hidden_size)
-            hidden = hidden.squeeze(0)  # (1, hidden_size)
-            
-            output = self.lb_model.forward_token(
-                hidden, self._cache, pos, compute_logits=False
-            )
+        # Prefill: only process uncached tokens
+        self.prefill(input_ids)
         
-        # Now generate K draft tokens
+        # Save cache position before generating drafts
+        # (we'll roll back after so next call can re-generate from this point)
+        cache_pos_before_draft = self._cache_pos
+        
+        # Generate K draft tokens
         draft_tokens = []
         draft_probs = []
-        last_hidden = output.hidden  # (1, hidden_size)
+        last_hidden = self._last_hidden  # (1, hidden_size)
         
         for k in range(draft_length):
-            # Get logits from lm_head
             logits = self._lm_head(last_hidden)  # (1, vocab_size)
             
             if greedy:
@@ -180,16 +225,16 @@ class CPUDraftModel:
                 next_token = torch.multinomial(probs, num_samples=1)
             
             draft_tokens.append(next_token)
-            draft_probs.append(probs.unsqueeze(0))  # (1, 1, vocab) -> match expected shape
+            draft_probs.append(probs.unsqueeze(0))
             
-            # Forward next token through transformer
-            hidden = self._embed(next_token)  # (1, 1, hidden_size)
-            hidden = hidden.squeeze(0)  # (1, hidden_size)
-            
-            pos = seq_len + k
-            output = self.lb_model.forward_token(
-                hidden, self._cache, pos, compute_logits=False
-            )
-            last_hidden = output.hidden
+            # Forward next token through transformer (updates cache)
+            token_id = next_token.reshape(-1)[0].item()
+            last_hidden = self._forward_token(token_id)
+        
+        # Roll back cache position — draft tokens are speculative,
+        # they'll be confirmed (or not) by the target model.
+        # On next call, caller will provide updated input_ids with accepted tokens.
+        self._cache_pos = cache_pos_before_draft
+        self._cached_seq_len = seq_len
         
         return draft_tokens, draft_probs
