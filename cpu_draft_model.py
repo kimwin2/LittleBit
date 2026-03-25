@@ -498,48 +498,76 @@ class CPUDraftModel:
             # Fallback: full prefill
             self.prefill(input_ids)
         
-        # Save cache position before generating drafts
-        cache_pos_before_draft = self._cache_pos
-        
         # Generate K draft tokens
         draft_tokens = []
         draft_probs = []
         
+        def _call_generate_token(tid, pos):
+            return torch.ops.littlebit_cpu_ops.generate_token(
+                tid,
+                self.embed_tokens,
+                self.lb_model.final_norm_weight.contiguous(),
+                self._layer_tensors,
+                self._kv_cache_tensors,
+                self._layer_dims,
+                self._lm_head_q4,
+                self._vocab_size,
+                self.config.num_hidden_layers,
+                self.config.hidden_size,
+                self.config.num_key_value_heads,
+                self.lb_model.kv_repeat,
+                self.lb_model.head_dim,
+                self.max_seq_len,
+                pos,
+                self.lb_model.attn_scale,
+                self.config.rms_norm_eps,
+            )
+        
         if self._use_generate_token:
             # ===== PURE C++ PATH =====
-            # First token: if not cached, generate_token processes it AND predicts next
-            # This avoids the redundant prefill forward + generate_token forward
             token_id = input_ids[0, -1].item()
             
-            for k in range(draft_length):
-                # Pure C++ generate: forward + Q4 lm_head + argmax
-                token_id = torch.ops.littlebit_cpu_ops.generate_token(
-                    token_id,
-                    self.embed_tokens,
-                    self.lb_model.final_norm_weight.contiguous(),
-                    self._layer_tensors,
-                    self._kv_cache_tensors,
-                    self._layer_dims,
-                    self._lm_head_q4,
-                    self._vocab_size,
-                    self.config.num_hidden_layers,
-                    self.config.hidden_size,
-                    self.config.num_key_value_heads,
-                    self.lb_model.kv_repeat,
-                    self.lb_model.head_dim,
-                    self.max_seq_len,
-                    self._cache_pos,
-                    self.lb_model.attn_scale,
-                    self.config.rms_norm_eps,
-                )
+            if self._cached_seq_len < seq_len:
+                # Last input token not yet cached.
+                # generate_token processes it (writes KV) AND predicts next token.
+                # This KV write is COMMITTED (not rolled back).
+                first_draft_id = _call_generate_token(token_id, self._cache_pos)
                 self._cache_pos += 1
-                next_token = torch.tensor([[token_id]], dtype=torch.long)
+                self._cached_seq_len = seq_len
+                
+                # Save position AFTER committing last input token
+                cache_pos_before_draft = self._cache_pos
+                
+                next_token = torch.tensor([[first_draft_id]], dtype=torch.long)
                 draft_tokens.append(next_token)
                 dummy_probs = torch.zeros(1, self._vocab_size)
-                dummy_probs[0, token_id] = 1.0
+                dummy_probs[0, first_draft_id] = 1.0
                 draft_probs.append(dummy_probs.unsqueeze(0))
+                
+                # Generate remaining K-1 draft tokens (speculative, will be rolled back)
+                token_id = first_draft_id
+                for k in range(1, draft_length):
+                    token_id = _call_generate_token(token_id, self._cache_pos)
+                    self._cache_pos += 1
+                    next_token = torch.tensor([[token_id]], dtype=torch.long)
+                    draft_tokens.append(next_token)
+                    dummy_probs = torch.zeros(1, self._vocab_size)
+                    dummy_probs[0, token_id] = 1.0
+                    draft_probs.append(dummy_probs.unsqueeze(0))
+            else:
+                # All input tokens already cached — generate K draft tokens
+                cache_pos_before_draft = self._cache_pos
+                for k in range(draft_length):
+                    token_id = _call_generate_token(token_id, self._cache_pos)
+                    self._cache_pos += 1
+                    next_token = torch.tensor([[token_id]], dtype=torch.long)
+                    draft_tokens.append(next_token)
+                    dummy_probs = torch.zeros(1, self._vocab_size)
+                    dummy_probs[0, token_id] = 1.0
+                    draft_probs.append(dummy_probs.unsqueeze(0))
         else:
             # ===== FALLBACK PYTHON PATH =====
+            cache_pos_before_draft = self._cache_pos
             last_hidden = self._last_hidden  # (1, hidden_size)
             
             for k in range(draft_length):
@@ -558,7 +586,7 @@ class CPUDraftModel:
                 token_id = next_token.reshape(-1)[0].item()
                 last_hidden = self._forward_token(token_id)
         
-        # Roll back cache position — draft tokens are speculative
+        # Roll back ONLY draft token positions (last input token stays committed)
         self._cache_pos = cache_pos_before_draft
         self._cached_seq_len = seq_len
         
