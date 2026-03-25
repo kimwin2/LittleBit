@@ -1516,7 +1516,6 @@ inline void fused_attention_inline(
                 for (int64_t d = 0; d < head_dim; ++d) out_ptr[d] += prob * v_t[d];
 #endif
             }
-        }
     }
 }
 
