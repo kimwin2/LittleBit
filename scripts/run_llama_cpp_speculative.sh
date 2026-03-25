@@ -157,24 +157,59 @@ model = CPUDraftModel(
     base_model_id='${FP_MODEL_DIR}',
 )
 
-# === PROFILE: 3 tokens with per-op breakdown ===
+# === PROFILE: per-op breakdown ===
 print('=== Per-operation profiling (3 tokens) ===', flush=True)
 model.reset()
 model._ensure_cache()
-# Token 1 with profiling
-model._forward_token(128000, profile=True)
-# lm_head profiling
-t0 = time.perf_counter()
-logits = model._lm_head(model._last_hidden)
-t_lm = time.perf_counter() - t0
-print(f'  lm_head: {t_lm*1000:.0f}ms', flush=True)
-tok = torch.argmax(logits, dim=-1).item()
-# Token 2
-model._forward_token(tok, profile=True)
-logits = model._lm_head(model._last_hidden)
-tok = torch.argmax(logits, dim=-1).item()
-# Token 3
-model._forward_token(tok, profile=True)
+
+for i in range(3):
+    tok_id = 128000 if i == 0 else tok
+    
+    # full_forward time
+    t0 = time.perf_counter()
+    model._forward_token(tok_id, profile=(i==0))
+    t_fwd = time.perf_counter() - t0
+    
+    # FP32 lm_head time
+    t0 = time.perf_counter()
+    logits = model._lm_head(model._last_hidden)
+    t_lm_fp32 = time.perf_counter() - t0
+    tok = torch.argmax(logits, dim=-1).item()
+    
+    # generate_token (if available): full_forward + Q4 lm_head + argmax in ONE C++ call
+    if model._use_generate_token:
+        model._cache_pos -= 1  # revert position for re-test
+        t0 = time.perf_counter()
+        tok2 = torch.ops.littlebit_cpu_ops.generate_token(
+            tok_id,
+            model.embed_tokens,
+            model.lb_model.final_norm_weight.contiguous(),
+            model._layer_tensors,
+            model._kv_cache_tensors,
+            model._layer_dims,
+            model._lm_head_q4,
+            model._vocab_size,
+            model.config.num_hidden_layers,
+            model.config.hidden_size,
+            model.config.num_key_value_heads,
+            model.lb_model.kv_repeat,
+            model.lb_model.head_dim,
+            model.max_seq_len,
+            model._cache_pos,
+            model.lb_model.attn_scale,
+            model.config.rms_norm_eps,
+        )
+        t_gen = time.perf_counter() - t0
+        model._cache_pos += 1
+        q4_lm_est = t_gen - t_fwd  # estimate Q4 lm_head time
+        print(f'  Token {i+1}: full_forward={t_fwd*1000:.0f}ms | '
+              f'lm_head_FP32={t_lm_fp32*1000:.0f}ms | '
+              f'generate_token={t_gen*1000:.0f}ms (fwd+Q4_lm+argmax) | '
+              f'Q4_lm_head~={max(0,q4_lm_est)*1000:.0f}ms', flush=True)
+    else:
+        print(f'  Token {i+1}: full_forward={t_fwd*1000:.0f}ms | '
+              f'lm_head_FP32={t_lm_fp32*1000:.0f}ms', flush=True)
+
 print('', flush=True)
 
 # === BENCHMARK: ${GEN_TOKENS} tokens ===
