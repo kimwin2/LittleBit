@@ -493,54 +493,37 @@ class CPUDraftModel:
         
         if self._use_generate_token:
             # ===== PURE C++ PATH =====
-            # Each call: full_forward + Q4 lm_head + argmax in ONE C++ call
-            last_token_id = input_ids[0, -1].item() if self._last_hidden is None else None
+            # ALL tokens: full_forward + Q4 lm_head + argmax in ONE C++ call
+            # Use the last token of input_ids as starting point
+            token_id = input_ids[0, -1].item()
             
             for k in range(draft_length):
-                if k == 0 and self._last_hidden is not None:
-                    # First draft: we already have last_hidden from prefill
-                    # Need lm_head + argmax for first token, then generate_token for rest
-                    logits = self._lm_head(self._last_hidden)
-                    if greedy:
-                        probs = F.softmax(logits / max(temperature, 1e-8), dim=-1)
-                        next_token = torch.argmax(logits, dim=-1, keepdim=True)
-                    else:
-                        probs = F.softmax(logits / max(temperature, 1e-8), dim=-1)
-                        next_token = torch.multinomial(probs, num_samples=1)
-                    draft_tokens.append(next_token)
-                    draft_probs.append(probs.unsqueeze(0))
-                    token_id = next_token.reshape(-1)[0].item()
-                else:
-                    if k == 0:
-                        token_id = last_token_id
-                    # Pure C++ generate: forward + Q4 lm_head + argmax
-                    token_id = torch.ops.littlebit_cpu_ops.generate_token(
-                        token_id,
-                        self.embed_tokens,
-                        self.lb_model.final_norm_weight.contiguous(),
-                        self._layer_tensors,
-                        self._kv_cache_tensors,
-                        self._layer_dims,
-                        self._lm_head_q4,
-                        self._vocab_size,
-                        self.config.num_hidden_layers,
-                        self.config.hidden_size,
-                        self.config.num_key_value_heads,
-                        self.lb_model.kv_repeat,
-                        self.lb_model.head_dim,
-                        self.max_seq_len,
-                        self._cache_pos,
-                        self.lb_model.attn_scale,
-                        self.config.rms_norm_eps,
-                    )
-                    self._cache_pos += 1
-                    next_token = torch.tensor([[token_id]], dtype=torch.long)
-                    # For pure C++ path, we don't have logits/probs
-                    # Create dummy uniform probs (speculative decoding will use target logits)
-                    draft_tokens.append(next_token)
-                    dummy_probs = torch.zeros(1, self._vocab_size)
-                    dummy_probs[0, token_id] = 1.0
-                    draft_probs.append(dummy_probs.unsqueeze(0))
+                # Pure C++ generate: forward + Q4 lm_head + argmax
+                token_id = torch.ops.littlebit_cpu_ops.generate_token(
+                    token_id,
+                    self.embed_tokens,
+                    self.lb_model.final_norm_weight.contiguous(),
+                    self._layer_tensors,
+                    self._kv_cache_tensors,
+                    self._layer_dims,
+                    self._lm_head_q4,
+                    self._vocab_size,
+                    self.config.num_hidden_layers,
+                    self.config.hidden_size,
+                    self.config.num_key_value_heads,
+                    self.lb_model.kv_repeat,
+                    self.lb_model.head_dim,
+                    self.max_seq_len,
+                    self._cache_pos,
+                    self.lb_model.attn_scale,
+                    self.config.rms_norm_eps,
+                )
+                self._cache_pos += 1
+                next_token = torch.tensor([[token_id]], dtype=torch.long)
+                draft_tokens.append(next_token)
+                dummy_probs = torch.zeros(1, self._vocab_size)
+                dummy_probs[0, token_id] = 1.0
+                draft_probs.append(dummy_probs.unsqueeze(0))
         else:
             # ===== FALLBACK PYTHON PATH =====
             last_hidden = self._last_hidden  # (1, hidden_size)

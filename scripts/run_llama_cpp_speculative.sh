@@ -165,20 +165,15 @@ model._ensure_cache()
 for i in range(3):
     tok_id = 128000 if i == 0 else tok
     
-    # full_forward time
+    # full_forward only (transformer)
     t0 = time.perf_counter()
     model._forward_token(tok_id, profile=(i==0))
     t_fwd = time.perf_counter() - t0
+    tok = torch.argmax(model._lm_head(model._last_hidden), dim=-1).item()
     
-    # FP32 lm_head time
-    t0 = time.perf_counter()
-    logits = model._lm_head(model._last_hidden)
-    t_lm_fp32 = time.perf_counter() - t0
-    tok = torch.argmax(logits, dim=-1).item()
-    
-    # generate_token (if available): full_forward + Q4 lm_head + argmax in ONE C++ call
+    # generate_token: full_forward + Q4 lm_head + argmax in ONE C++ call
     if model._use_generate_token:
-        model._cache_pos -= 1  # revert position for re-test
+        model._cache_pos -= 1  # revert for re-test
         t0 = time.perf_counter()
         tok2 = torch.ops.littlebit_cpu_ops.generate_token(
             tok_id,
@@ -201,14 +196,11 @@ for i in range(3):
         )
         t_gen = time.perf_counter() - t0
         model._cache_pos += 1
-        q4_lm_est = t_gen - t_fwd  # estimate Q4 lm_head time
-        print(f'  Token {i+1}: full_forward={t_fwd*1000:.0f}ms | '
-              f'lm_head_FP32={t_lm_fp32*1000:.0f}ms | '
-              f'generate_token={t_gen*1000:.0f}ms (fwd+Q4_lm+argmax) | '
-              f'Q4_lm_head~={max(0,q4_lm_est)*1000:.0f}ms', flush=True)
+        t_q4_lm = max(0, t_gen - t_fwd)
+        print(f'  Token {i+1}: generate_token={t_gen*1000:.0f}ms '
+              f'(full_forward={t_fwd*1000:.0f}ms + Q4_lm_head={t_q4_lm*1000:.0f}ms)', flush=True)
     else:
-        print(f'  Token {i+1}: full_forward={t_fwd*1000:.0f}ms | '
-              f'lm_head_FP32={t_lm_fp32*1000:.0f}ms', flush=True)
+        print(f'  Token {i+1}: full_forward={t_fwd*1000:.0f}ms', flush=True)
 
 print('', flush=True)
 
