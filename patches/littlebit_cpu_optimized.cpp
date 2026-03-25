@@ -1598,14 +1598,6 @@ at::Tensor full_forward_cpu(
                 static_cast<int>(at::get_num_threads()));
     });
 
-    // Profiling accumulators (first call only)
-    double t_vstage = 0, t_ustage = 0, t_attn = 0, t_rms = 0, t_silu = 0, t_resid = 0;
-    auto now = []() { 
-        struct timespec ts;
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        return ts.tv_sec + ts.tv_nsec * 1e-9;
-    };
-
     // Embedding: buf0 = embed_weight[token_id]
     float * x_ptr = scratch.buf0.data();
     float * res_ptr = scratch.buf1.data();
@@ -1615,26 +1607,38 @@ at::Tensor full_forward_cpu(
     const float eps = static_cast<float>(rms_eps);
     const float scale = static_cast<float>(attn_scale);
 
+    // Pre-collect per-projection info for batched U-stage
+    // 7 projections per layer: indices [q=0, k=1, v=2, o=3, gate=4, up=5, down=6]
+    struct UStageWork {
+        const int8_t * q2_data;
+        const uint8_t * u_i2;
+        int64_t u_i2_stride;
+        const float * u1;
+        float * output;
+        float inv_scale2;
+        int32_t sum_all_q2;
+        int64_t u_cols;
+        int64_t out_features;
+        int64_t row_offset;  // cumulative offset in the flattened row space
+    };
+
     for (int64_t layer = 0; layer < num_layers; ++layer) {
-        const int64_t tbase = layer * 37;  // tensor offset
-        const int64_t dbase = layer * 28;  // dims offset
+        const int64_t tbase = layer * 37;
+        const int64_t dbase = layer * 28;
 
         const float * ln1_w = layer_tensors[tbase + 0].data_ptr<float>();
         const float * ln2_w = layer_tensors[tbase + 1].data_ptr<float>();
 
-        // ** OPTIMIZED: pointer swap instead of memcpy for residual **
         std::swap(x_ptr, res_ptr);
-
-        // RMSNorm
-        double t0 = do_profile ? now() : 0;
         rms_norm_inline(res_ptr, ln1_w, eps, hidden_size, scratch.normed.data());
-        if (do_profile) t_rms += now() - t0;
 
-        // 7 projections with split V/U timing
-        auto do_proj_profiled = [&](int64_t p, const float * input_data, float * out_data) {
+        // Helper: run V-stage for a projection, prepare U-stage work item
+        // V-stage is serial (rank is small), U-stage is batched below
+        auto do_vstage = [&](int64_t p, const float * input_data, float * out_data,
+                             int8_t * q1, float * s1, int8_t * q2,
+                             UStageWork & work) {
             const int64_t to = tbase + 2 + p * 5;
             const int64_t do_ = dbase + p * 4;
-
             const int64_t v_cols = layer_dims[do_ + 0];
             const int64_t rank = layer_dims[do_ + 1];
             const int64_t u_cols = layer_dims[do_ + 2];
@@ -1644,70 +1648,105 @@ at::Tensor full_forward_cpu(
             const uint8_t * v_i2 = layer_tensors[to + 1].data_ptr<uint8_t>();
             const int64_t v_i2_stride = layer_tensors[to + 1].size(1);
             const float * mid_p = layer_tensors[to + 2].data_ptr<float>();
-            const uint8_t * u_i2 = layer_tensors[to + 3].data_ptr<uint8_t>();
-            const int64_t u_i2_stride = layer_tensors[to + 3].size(1);
-            const float * u1 = layer_tensors[to + 4].data_ptr<float>();
 
-            // V-stage timing
-            double tv0 = do_profile ? now() : 0;
-
-            // V-stage: quantize(input * v2) × v_sign_i2 → stage1 × mid
-            const float scale1 = quantize_mul_row_to_int8(
-                input_data, v2, v_cols, scratch.q1_buf.data());
+            // V-stage: quantize(input * v2) × v_sign_i2
+            const float scale1 = quantize_mul_row_to_int8(input_data, v2, v_cols, q1);
             const float inv_scale1 = 1.0f / scale1;
 #ifdef __AVX2__
-            const int32_t sum_all_q1 = sum_int8_row_avx2(scratch.q1_buf.data(), v_cols);
+            const int32_t sum_all_q1 = sum_int8_row_avx2(q1, v_cols);
             for (int64_t r = 0; r < rank; ++r) {
                 const int32_t acc = dot_int8_x_i2_row_avx2(
-                    scratch.q1_buf.data(),
-                    v_i2 + r * v_i2_stride, v_cols, sum_all_q1);
-                scratch.stage1_buf.data()[r] = static_cast<float>(acc) * inv_scale1 * mid_p[r];
+                    q1, v_i2 + r * v_i2_stride, v_cols, sum_all_q1);
+                s1[r] = static_cast<float>(acc) * inv_scale1 * mid_p[r];
             }
 #endif
-            if (do_profile) t_vstage += now() - tv0;
-
-            // U-stage timing
-            double tu0 = do_profile ? now() : 0;
-
-            const float scale2 = quantize_row_to_int8(
-                scratch.stage1_buf.data(), rank, scratch.q2_buf.data());
-            const float inv_scale2 = 1.0f / scale2;
+            // Prepare U-stage: quantize stage1 → int8
+            const float scale2 = quantize_row_to_int8(s1, rank, q2);
+            work.q2_data = q2;
+            work.u_i2 = layer_tensors[to + 3].data_ptr<uint8_t>();
+            work.u_i2_stride = layer_tensors[to + 3].size(1);
+            work.u1 = layer_tensors[to + 4].data_ptr<float>();
+            work.output = out_data;
+            work.inv_scale2 = 1.0f / scale2;
 #ifdef __AVX2__
-            const int32_t sum_all_q2 = sum_int8_row_avx2(scratch.q2_buf.data(), rank);
-            at::parallel_for(0, out_f, 1, [&](int64_t begin, int64_t end) {
-                for (int64_t o = begin; o < end; ++o) {
-                    const int32_t acc = dot_int8_x_i2_row_avx2(
-                        scratch.q2_buf.data(),
-                        u_i2 + o * u_i2_stride, u_cols, sum_all_q2);
-                    out_data[o] = static_cast<float>(acc) * inv_scale2 * u1[o];
-                }
-            });
+            work.sum_all_q2 = sum_int8_row_avx2(q2, rank);
 #endif
-            if (do_profile) t_ustage += now() - tu0;
+            work.u_cols = u_cols;
+            work.out_features = out_f;
         };
 
-        // Q, K, V projections
-        do_proj_profiled(0, scratch.normed.data(), scratch.q_out.data());
-        do_proj_profiled(1, scratch.normed.data(), scratch.k_out.data());
-        do_proj_profiled(2, scratch.normed.data(), scratch.v_out.data());
+        // ===== Attention block: Q, K, V projections =====
+        // Allocate separate scratch per projection (V-stage is serial, needs own buffers)
+        // We reuse the main scratch for each since they're sequential
+        thread_local std::vector<int8_t> q1_a, q2_a, q1_b, q2_b, q1_c, q2_c;
+        thread_local std::vector<float> s1_a, s1_b, s1_c;
+        q1_a.resize(max_v); s1_a.resize(max_r); q2_a.resize(max_r);
+        q1_b.resize(max_v); s1_b.resize(max_r); q2_b.resize(max_r);
+        q1_c.resize(max_v); s1_c.resize(max_r); q2_c.resize(max_r);
+
+        UStageWork attn_works[4];  // q, k, v, o
+
+        // V-stage for Q, K, V (serial, each with own scratch)
+        do_vstage(0, scratch.normed.data(), scratch.q_out.data(),
+                  q1_a.data(), s1_a.data(), q2_a.data(), attn_works[0]);
+        do_vstage(1, scratch.normed.data(), scratch.k_out.data(),
+                  q1_b.data(), s1_b.data(), q2_b.data(), attn_works[1]);
+        do_vstage(2, scratch.normed.data(), scratch.v_out.data(),
+                  q1_c.data(), s1_c.data(), q2_c.data(), attn_works[2]);
+
+        // ** BATCHED U-stage for Q, K, V: ONE parallel_for instead of 3 **
+        int64_t total_qkv_rows = 0;
+        for (int i = 0; i < 3; ++i) {
+            attn_works[i].row_offset = total_qkv_rows;
+            total_qkv_rows += attn_works[i].out_features;
+        }
+#ifdef __AVX2__
+        at::parallel_for(0, total_qkv_rows, 1, [&](int64_t begin, int64_t end) {
+            for (int64_t flat_row = begin; flat_row < end; ++flat_row) {
+                // Find which projection this row belongs to
+                const UStageWork * w;
+                int64_t local_row;
+                if (flat_row < attn_works[0].row_offset + attn_works[0].out_features) {
+                    w = &attn_works[0]; local_row = flat_row - attn_works[0].row_offset;
+                } else if (flat_row < attn_works[1].row_offset + attn_works[1].out_features) {
+                    w = &attn_works[1]; local_row = flat_row - attn_works[1].row_offset;
+                } else {
+                    w = &attn_works[2]; local_row = flat_row - attn_works[2].row_offset;
+                }
+                const int32_t acc = dot_int8_x_i2_row_avx2(
+                    w->q2_data, w->u_i2 + local_row * w->u_i2_stride,
+                    w->u_cols, w->sum_all_q2);
+                w->output[local_row] = static_cast<float>(acc) * w->inv_scale2 * w->u1[local_row];
+            }
+        });
+#endif
 
         // Fused attention
         float * k_cache = kv_caches[layer * 2 + 0].data_ptr<float>();
         float * v_cache = kv_caches[layer * 2 + 1].data_ptr<float>();
 
-        t0 = do_profile ? now() : 0;
         fused_attention_inline(
             scratch.q_out.data(), scratch.k_out.data(), scratch.v_out.data(),
             k_cache, v_cache,
             position, num_kv_heads, kv_repeat, head_dim,
             max_seq_len, scale, scratch.attn_out.data());
-        if (do_profile) t_attn += now() - t0;
 
-        // O projection
-        do_proj_profiled(3, scratch.attn_out.data(), scratch.o_out.data());
+        // O projection: V-stage + U-stage (single projection, use parallel_for)
+        do_vstage(3, scratch.attn_out.data(), scratch.o_out.data(),
+                  scratch.q1_buf.data(), scratch.stage1_buf.data(), scratch.q2_buf.data(),
+                  attn_works[3]);
+#ifdef __AVX2__
+        at::parallel_for(0, attn_works[3].out_features, 1, [&](int64_t begin, int64_t end) {
+            const auto & w = attn_works[3];
+            for (int64_t o = begin; o < end; ++o) {
+                const int32_t acc = dot_int8_x_i2_row_avx2(
+                    w.q2_data, w.u_i2 + o * w.u_i2_stride, w.u_cols, w.sum_all_q2);
+                w.output[o] = static_cast<float>(acc) * w.inv_scale2 * w.u1[o];
+            }
+        });
+#endif
 
-        // Residual add
-        t0 = do_profile ? now() : 0;
+        // Residual add: x = residual + o_out
 #ifdef __AVX2__
         for (int64_t i = 0; i + 8 <= hidden_size; i += 8) {
             _mm256_storeu_ps(x_ptr + i,
@@ -1720,32 +1759,64 @@ at::Tensor full_forward_cpu(
         for (int64_t i = 0; i < hidden_size; ++i)
             x_ptr[i] = res_ptr[i] + scratch.o_out[i];
 #endif
-        if (do_profile) t_resid += now() - t0;
 
-        // MLP: swap for second residual
+        // ===== MLP block =====
         std::swap(x_ptr, res_ptr);
-
-        // Post-attention RMSNorm
-        t0 = do_profile ? now() : 0;
         rms_norm_inline(res_ptr, ln2_w, eps, hidden_size, scratch.normed.data());
-        if (do_profile) t_rms += now() - t0;
 
-        // Gate and Up projections
-        do_proj_profiled(4, scratch.normed.data(), scratch.gate_out.data());
-        do_proj_profiled(5, scratch.normed.data(), scratch.up_out.data());
+        // Gate, Up, Down projections — V-stage serial, U-stage batched
+        UStageWork mlp_works[3];  // gate, up, down
+
+        do_vstage(4, scratch.normed.data(), scratch.gate_out.data(),
+                  q1_a.data(), s1_a.data(), q2_a.data(), mlp_works[0]);
+        do_vstage(5, scratch.normed.data(), scratch.up_out.data(),
+                  q1_b.data(), s1_b.data(), q2_b.data(), mlp_works[1]);
+
+        // ** BATCHED U-stage for gate+up: ONE parallel_for instead of 2 **
+        int64_t total_mlp_rows = 0;
+        for (int i = 0; i < 2; ++i) {
+            mlp_works[i].row_offset = total_mlp_rows;
+            total_mlp_rows += mlp_works[i].out_features;
+        }
+#ifdef __AVX2__
+        at::parallel_for(0, total_mlp_rows, 1, [&](int64_t begin, int64_t end) {
+            for (int64_t flat_row = begin; flat_row < end; ++flat_row) {
+                const UStageWork * w;
+                int64_t local_row;
+                if (flat_row < mlp_works[0].row_offset + mlp_works[0].out_features) {
+                    w = &mlp_works[0]; local_row = flat_row - mlp_works[0].row_offset;
+                } else {
+                    w = &mlp_works[1]; local_row = flat_row - mlp_works[1].row_offset;
+                }
+                const int32_t acc = dot_int8_x_i2_row_avx2(
+                    w->q2_data, w->u_i2 + local_row * w->u_i2_stride,
+                    w->u_cols, w->sum_all_q2);
+                w->output[local_row] = static_cast<float>(acc) * w->inv_scale2 * w->u1[local_row];
+            }
+        });
+#endif
 
         // SiLU-mul
         const int64_t intermediate_size = layer_dims[dbase + 4 * 4 + 3];
-        t0 = do_profile ? now() : 0;
         silu_mul_inline(scratch.gate_out.data(), scratch.up_out.data(),
                         intermediate_size, scratch.mlp_hidden.data());
-        if (do_profile) t_silu += now() - t0;
 
-        // Down projection
-        do_proj_profiled(6, scratch.mlp_hidden.data(), scratch.down_out.data());
+        // Down projection V-stage + U-stage
+        do_vstage(6, scratch.mlp_hidden.data(), scratch.down_out.data(),
+                  scratch.q1_buf.data(), scratch.stage1_buf.data(), scratch.q2_buf.data(),
+                  mlp_works[2]);
+#ifdef __AVX2__
+        at::parallel_for(0, mlp_works[2].out_features, 1, [&](int64_t begin, int64_t end) {
+            const auto & w = mlp_works[2];
+            for (int64_t o = begin; o < end; ++o) {
+                const int32_t acc = dot_int8_x_i2_row_avx2(
+                    w.q2_data, w.u_i2 + o * w.u_i2_stride, w.u_cols, w.sum_all_q2);
+                w.output[o] = static_cast<float>(acc) * w.inv_scale2 * w.u1[o];
+            }
+        });
+#endif
 
-        // Residual add
-        t0 = do_profile ? now() : 0;
+        // Residual add: x = residual + down_out
 #ifdef __AVX2__
         for (int64_t i = 0; i + 8 <= hidden_size; i += 8) {
             _mm256_storeu_ps(x_ptr + i,
@@ -1758,22 +1829,6 @@ at::Tensor full_forward_cpu(
         for (int64_t i = 0; i < hidden_size; ++i)
             x_ptr[i] = res_ptr[i] + scratch.down_out[i];
 #endif
-        if (do_profile) t_resid += now() - t0;
-    }
-
-    // Print profile on first call
-    if (do_profile) {
-        do_profile = false;
-        double total = t_vstage + t_ustage + t_attn + t_rms + t_silu + t_resid;
-        fprintf(stderr,
-            "[littlebit_cpu] PROFILE (32 layers): total=%.1fms\n"
-            "  V-stage=%.1fms (%.0f%%)  U-stage=%.1fms (%.0f%%)\n"
-            "  Attn=%.1fms (%.0f%%)  RMS=%.1fms  SiLU=%.1fms  Resid=%.1fms\n",
-            total * 1000,
-            t_vstage * 1000, t_vstage / total * 100,
-            t_ustage * 1000, t_ustage / total * 100,
-            t_attn * 1000, t_attn / total * 100,
-            t_rms * 1000, t_silu * 1000, t_resid * 1000);
     }
 
     // Final RMSNorm — output directly to result tensor
@@ -2001,7 +2056,7 @@ int64_t generate_token_cpu(
     thread_local std::vector<float> logits_buf;
     logits_buf.resize(vocab_size);
 
-    at::parallel_for(0, vocab_size, 0, [&](int64_t begin, int64_t end) {
+    at::parallel_for(0, vocab_size, 1, [&](int64_t begin, int64_t end) {
         for (int64_t row = begin; row < end; ++row) {
             const block_q4_0 * w_row = reinterpret_cast<const block_q4_0 *>(
                 q4_ptr + row * bytes_per_row);

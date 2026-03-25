@@ -481,8 +481,21 @@ class CPUDraftModel:
         if self._cached_seq_len > seq_len:
             self.reset()
         
-        # Prefill: only process uncached tokens
-        self.prefill(input_ids)
+        if self._use_generate_token:
+            # ===== OPTIMIZED PATH: avoid double forward on last token =====
+            # Prefill all tokens EXCEPT the last uncached one.
+            # The last uncached token is handled by generate_token which does
+            # full_forward + lm_head + argmax in one C++ call.
+            self._ensure_cache()
+            uncached_start = self._cached_seq_len if self._cached_seq_len < seq_len else seq_len
+            
+            # Process tokens [uncached_start, seq_len-1) via _forward_token
+            for pos in range(uncached_start, seq_len - 1):
+                self._forward_token(input_ids[0, pos].item())
+            self._cached_seq_len = max(self._cached_seq_len, seq_len - 1)
+        else:
+            # Fallback: full prefill
+            self.prefill(input_ids)
         
         # Save cache position before generating drafts
         cache_pos_before_draft = self._cache_pos
@@ -493,8 +506,8 @@ class CPUDraftModel:
         
         if self._use_generate_token:
             # ===== PURE C++ PATH =====
-            # ALL tokens: full_forward + Q4 lm_head + argmax in ONE C++ call
-            # Use the last token of input_ids as starting point
+            # First token: if not cached, generate_token processes it AND predicts next
+            # This avoids the redundant prefill forward + generate_token forward
             token_id = input_ids[0, -1].item()
             
             for k in range(draft_length):
