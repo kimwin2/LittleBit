@@ -57,7 +57,7 @@ def main():
     print("=" * 70)
 
     # Load draft model with C++ kernel
-    draft_cpp = CPUDraftModel(RUNTIME_PATH, target_model_path=TARGET_PATH, max_seq_len=256)
+    draft_cpp = CPUDraftModel(RUNTIME_PATH, base_model_id=TARGET_PATH)
     draft_cpp._ensure_cache()
 
     # Run Python path: process all tokens via _forward_token
