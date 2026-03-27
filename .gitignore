@@ -15,6 +15,7 @@ dev
 *.o
 .vscode
 *.sh
+!setup_env.sh
 build
 dist
 outputs
