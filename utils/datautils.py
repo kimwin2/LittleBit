@@ -74,13 +74,26 @@ def prepare_dataset(args, tokenizer):
     dataset = os.path.join(args.data_root, args.dataset, hash_value)
 
     logger.info(f"Attempting to load dataset from disk at '{dataset}'")
+    need_regenerate = False
     try:
         datasets = load_from_disk(dataset)
-        logger.info(f"Successfully loaded dataset from disk at '{dataset}'")
+        if len(datasets) == 0:
+            logger.warning(f"Cached dataset at '{dataset}' has 0 samples! Will regenerate.")
+            need_regenerate = True
+        else:
+            logger.info(f"Successfully loaded dataset from disk at '{dataset}' ({len(datasets)} samples)")
     except (FileNotFoundError, OSError) as e:
         logger.warning(f"Failed to load dataset from disk at '{dataset}': {e}")
+        need_regenerate = True
+
+    if need_regenerate:
         logger.info("Generating new dataset using get_qat_dataset")
-        datasets = get_qat_dataset(args.dataset, tokenizer, sharegpt_path=getattr(args, 'sharegpt_path', None))
+        datasets = get_qat_dataset(args.dataset, tokenizer, sharegpt_path=getattr(args, 'sharegpt_path', None), data_root=args.data_root)
+        if len(datasets) == 0:
+            raise ValueError(
+                f"Generated dataset for '{args.dataset}' has 0 samples. "
+                f"Check your data source and tokenizer configuration."
+            )
         datasets.save_to_disk(dataset)
         logger.info(f"Dataset saved to disk at '{dataset}'")
         with open(os.path.join(dataset, "tokenizer_info"), "w") as f:
@@ -101,7 +114,7 @@ def load_tokenizer(model_id):
     return tokenizer
 
 
-def get_qat_dataset(name, tokenizer, sharegpt_path=None):
+def get_qat_dataset(name, tokenizer, sharegpt_path=None, data_root="./"):
     if name == "wikitext2":
         data = get_wikitext2_train(tokenizer=tokenizer)
     elif name == "c4":
@@ -111,7 +124,7 @@ def get_qat_dataset(name, tokenizer, sharegpt_path=None):
     elif name == "wikitext2_sharegpt":
         data = get_wikitext2_sharegpt_train(tokenizer=tokenizer, sharegpt_path=sharegpt_path)
     elif name == "openhermes":
-        data = get_openhermes_train(tokenizer=tokenizer)
+        data = get_openhermes_train(tokenizer=tokenizer, data_root=data_root)
     return data
 
 
@@ -274,21 +287,39 @@ def _convert_openhermes_to_chat_messages(conversations):
     return messages
 
 
-def get_openhermes_train(tokenizer, num_samples=50000, seed=42, seqlen=2048):
+def get_openhermes_train(tokenizer, num_samples=50000, seed=42, seqlen=2048, data_root="./"):
     """OpenHermes 2.5 dataset with Llama 3.1 chat template applied.
 
-    - Downloads teknium/OpenHermes-2.5 from HuggingFace
+    - First tries to load from pre-downloaded cache at {data_root}/data/openhermes_raw
+    - Falls back to downloading teknium/OpenHermes-2.5 from HuggingFace
     - Randomly samples `num_samples` conversations
     - Applies tokenizer.apply_chat_template() for Llama 3.1 format
     - Truncates to `seqlen` tokens, filters out very short samples
     """
-    logger.info(f"Loading OpenHermes 2.5 dataset (sampling {num_samples} from ~1M)...")
-    dataset = load_dataset("teknium/OpenHermes-2.5", split="train")
-    logger.info(f"  Full dataset size: {len(dataset)}")
+    # Try loading from pre-downloaded cache first (created by prepare_datasets.sh)
+    local_cache = os.path.join(data_root, "data", "openhermes_raw")
+    dataset = None
+    if os.path.exists(local_cache):
+        try:
+            logger.info(f"Loading OpenHermes from local cache: {local_cache}")
+            dataset = load_from_disk(local_cache)
+            logger.info(f"  Loaded {len(dataset)} conversations from local cache")
+        except Exception as e:
+            logger.warning(f"  Failed to load local cache: {e}")
+            dataset = None
 
-    # Random sampling
-    dataset = dataset.shuffle(seed=seed).select(range(min(num_samples, len(dataset))))
-    logger.info(f"  Sampled {len(dataset)} conversations")
+    if dataset is None:
+        logger.info(f"Loading OpenHermes 2.5 dataset from HuggingFace (sampling {num_samples} from ~1M)...")
+        dataset = load_dataset("teknium/OpenHermes-2.5", split="train")
+        logger.info(f"  Full dataset size: {len(dataset)}")
+        # Random sampling
+        dataset = dataset.shuffle(seed=seed).select(range(min(num_samples, len(dataset))))
+        logger.info(f"  Sampled {len(dataset)} conversations")
+    else:
+        # Local cache may already be sampled; if larger than num_samples, re-sample
+        if len(dataset) > num_samples:
+            dataset = dataset.shuffle(seed=seed).select(range(num_samples))
+            logger.info(f"  Re-sampled to {len(dataset)} conversations")
 
     # Convert each conversation using chat template
     all_input_ids = []
