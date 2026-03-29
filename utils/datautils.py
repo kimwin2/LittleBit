@@ -355,12 +355,19 @@ def get_openhermes_train(tokenizer, num_samples=50000, seed=42, seqlen=2048, dat
 
         # Use tokenizer's built-in chat template (Llama 3.1 format)
         try:
-            input_ids = tokenizer.apply_chat_template(
+            result = tokenizer.apply_chat_template(
                 messages,
                 tokenize=True,
                 add_generation_prompt=False,
-                return_tensors=None,  # Return plain list
+                return_tensors=None,
             )
+            # Handle both return types:
+            #   - transformers < 4.47: returns List[int]
+            #   - transformers >= 4.47: may return dict {"input_ids": [...], ...}
+            if isinstance(result, dict):
+                input_ids = result["input_ids"]
+            else:
+                input_ids = result
         except Exception as e:
             if skip_template_error < 5:
                 logger.error(f"  [SAMPLE {i}] apply_chat_template FAILED: {e}")
