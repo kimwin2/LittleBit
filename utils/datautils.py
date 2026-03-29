@@ -322,22 +322,35 @@ def get_openhermes_train(tokenizer, num_samples=50000, seed=42, seqlen=2048, dat
             dataset = dataset.shuffle(seed=seed).select(range(num_samples))
             logger.info(f"  Re-sampled to {len(dataset)} conversations")
 
+    # Diagnostic: check chat template availability
+    has_chat_template = hasattr(tokenizer, 'chat_template') and tokenizer.chat_template is not None
+    logger.info(f"  Tokenizer chat_template available: {has_chat_template}")
+    if not has_chat_template:
+        logger.warning("  Tokenizer has NO chat_template! apply_chat_template will fail for all samples.")
+        logger.warning(f"  Tokenizer class: {type(tokenizer).__name__}")
+        logger.warning(f"  Tokenizer name_or_path: {tokenizer.name_or_path}")
+
     # Convert each conversation using chat template
     all_input_ids = []
     all_attention_mask = []
     all_labels = []
-    skipped = 0
     min_length = 32  # Skip conversations shorter than this
+
+    # Track skip reasons for debugging
+    skip_empty = 0
+    skip_few_messages = 0
+    skip_template_error = 0
+    skip_too_short = 0
 
     for i, example in enumerate(dataset):
         conversations = example.get("conversations", [])
         if not conversations:
-            skipped += 1
+            skip_empty += 1
             continue
 
         messages = _convert_openhermes_to_chat_messages(conversations)
         if len(messages) < 2:  # Need at least user + assistant
-            skipped += 1
+            skip_few_messages += 1
             continue
 
         # Use tokenizer's built-in chat template (Llama 3.1 format)
@@ -349,14 +362,15 @@ def get_openhermes_train(tokenizer, num_samples=50000, seed=42, seqlen=2048, dat
                 return_tensors=None,  # Return plain list
             )
         except Exception as e:
-            if i < 3:
-                logger.warning(f"  Failed to apply chat template to sample {i}: {e}")
-            skipped += 1
+            if skip_template_error < 5:
+                logger.error(f"  [SAMPLE {i}] apply_chat_template FAILED: {e}")
+                logger.error(f"  [SAMPLE {i}] messages (first 2): {messages[:2]}")
+            skip_template_error += 1
             continue
 
         # Filter too short
         if len(input_ids) < min_length:
-            skipped += 1
+            skip_too_short += 1
             continue
 
         # Truncate to seqlen
@@ -377,9 +391,11 @@ def get_openhermes_train(tokenizer, num_samples=50000, seed=42, seqlen=2048, dat
         all_labels.append(labels)
 
         if (i + 1) % 10000 == 0:
-            logger.info(f"  Processed {i + 1}/{len(dataset)} conversations...")
+            logger.info(f"  Processed {i + 1}/{len(dataset)} conversations ({len(all_input_ids)} accepted)...")
 
-    logger.info(f"  Skipped {skipped} conversations (empty/short/error)")
+    total_skipped = skip_empty + skip_few_messages + skip_template_error + skip_too_short
+    logger.info(f"  Skip breakdown: empty={skip_empty}, few_messages={skip_few_messages}, "
+                f"template_error={skip_template_error}, too_short={skip_too_short}, total={total_skipped}")
     logger.info(f"  Final dataset: {len(all_input_ids)} samples, seqlen={seqlen}")
 
     processed_dataset = datasets.Dataset.from_dict({
