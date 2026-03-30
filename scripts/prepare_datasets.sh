@@ -20,7 +20,7 @@ set -e
 OUTPUT_DIR="./data"
 
 # Number of samples to use from OpenHermes 2.5 (~1M total)
-NUM_SAMPLES=50000
+NUM_SAMPLES=20000
 
 # Random seed for sampling
 SEED=42

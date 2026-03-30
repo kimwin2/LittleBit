@@ -39,6 +39,7 @@ KV_FACTOR=1.0
 MIN_SPLIT_DIM=8
 
 # Training
+NUM_SAMPLES=20000     # Number of dataset samples (set to 20000 for quick experiments)
 NUM_EPOCHS=3
 BATCH_SIZE=4
 GRAD_ACC_STEPS=1
@@ -98,6 +99,7 @@ deepspeed --num_gpus=${NUM_GPUS} train_step1_draft.py \
     --warmup_ratio ${WARMUP_RATIO} \
     --l2l_loss_scale ${L2L_LOSS_SCALE} \
     --ds_config_path ${DS_CONFIG} \
+    --num_samples ${NUM_SAMPLES} \
     --run_name ${RUN_NAME} \
     --report ${REPORT} \
     --train_time_test ${TRAIN_TIME_TEST} \

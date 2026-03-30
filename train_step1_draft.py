@@ -73,6 +73,8 @@ def get_args():
                         choices=['c4', 'wikitext2', 'c4_wiki', 'wikitext2_sharegpt', 'openhermes'])
     parser.add_argument("--sharegpt_path", type=str, default=None,
                         help="Path to local ShareGPT .jsonl file (optional)")
+    parser.add_argument("--num_samples", type=int, default=50000,
+                        help="Number of samples to use from the dataset (default: 50000)")
     parser.add_argument("--save_dir", type=str, default='outputs/step1_draft_0.1bit')
     parser.add_argument("--f_name", type=str, default=None)
     parser.add_argument("--seed", type=int, default=42, help="Seed")

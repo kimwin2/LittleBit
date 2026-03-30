@@ -82,13 +82,19 @@ def prepare_dataset(args, tokenizer):
             need_regenerate = True
         else:
             logger.info(f"Successfully loaded dataset from disk at '{dataset}' ({len(datasets)} samples)")
-    except (FileNotFoundError, OSError) as e:
+    except Exception as e:
         logger.warning(f"Failed to load dataset from disk at '{dataset}': {e}")
         need_regenerate = True
 
     if need_regenerate:
-        logger.info("Generating new dataset using get_qat_dataset")
+        # Delete corrupted/empty cache before regenerating
+        if os.path.exists(dataset):
+            import shutil
+            logger.info(f"Deleting old cache at '{dataset}' before regeneration...")
+            shutil.rmtree(dataset, ignore_errors=True)
+
         num_samples = getattr(args, 'num_samples', 50000)
+        logger.info(f"Generating new dataset using get_qat_dataset (num_samples={num_samples})")
         datasets = get_qat_dataset(args.dataset, tokenizer, sharegpt_path=getattr(args, 'sharegpt_path', None), data_root=args.data_root, num_samples=num_samples)
         if len(datasets) == 0:
             raise ValueError(
@@ -361,17 +367,50 @@ def get_openhermes_train(tokenizer, num_samples=50000, seed=42, seqlen=2048, dat
                 add_generation_prompt=False,
                 return_tensors=None,
             )
-            # Handle both return types:
-            #   - transformers < 4.47: returns List[int]
-            #   - transformers >= 4.47: may return dict {"input_ids": [...], ...}
-            if isinstance(result, dict):
+
+            # --- Robust extraction of input_ids from all possible return types ---
+            # transformers versions return different types:
+            #   - List[int]:              direct token ids
+            #   - List[List[int]]:        batch-wrapped token ids
+            #   - dict/BatchEncoding:     {"input_ids": List[int] or List[List[int]], ...}
+            if hasattr(result, 'input_ids'):
+                # BatchEncoding object (has .input_ids attribute)
+                input_ids = result.input_ids
+            elif isinstance(result, dict):
                 input_ids = result["input_ids"]
             else:
                 input_ids = result
+
+            # Unwrap nested list: [[1, 2, 3, ...]] -> [1, 2, 3, ...]
+            if isinstance(input_ids, list) and len(input_ids) > 0 and isinstance(input_ids[0], list):
+                input_ids = input_ids[0]
+
+            # Convert tensor to list if needed
+            if hasattr(input_ids, 'tolist'):
+                input_ids = input_ids.tolist()
+                # Unwrap batch dim from tensor: [[1,2,3]] -> [1,2,3]
+                if isinstance(input_ids, list) and len(input_ids) > 0 and isinstance(input_ids[0], list):
+                    input_ids = input_ids[0]
+
+            # Diagnostic: log first sample's return info
+            if i == 0:
+                logger.info(f"  [DIAGNOSTIC] apply_chat_template return type: {type(result).__name__}")
+                logger.info(f"  [DIAGNOSTIC] extracted input_ids type: {type(input_ids).__name__}, len: {len(input_ids)}")
+                if isinstance(input_ids, list) and len(input_ids) > 0:
+                    logger.info(f"  [DIAGNOSTIC] first element type: {type(input_ids[0]).__name__}, value: {input_ids[0]}")
+                    logger.info(f"  [DIAGNOSTIC] first 10 tokens: {input_ids[:10]}")
+
         except Exception as e:
             if skip_template_error < 5:
                 logger.error(f"  [SAMPLE {i}] apply_chat_template FAILED: {e}")
                 logger.error(f"  [SAMPLE {i}] messages (first 2): {messages[:2]}")
+            skip_template_error += 1
+            continue
+
+        # Validate input_ids is a flat list of integers
+        if not isinstance(input_ids, list) or len(input_ids) == 0:
+            if skip_template_error < 5:
+                logger.error(f"  [SAMPLE {i}] input_ids invalid: type={type(input_ids).__name__}, len={len(input_ids) if hasattr(input_ids, '__len__') else 'N/A'}")
             skip_template_error += 1
             continue
 
