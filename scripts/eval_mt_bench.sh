@@ -32,7 +32,7 @@ EVAL_FP="false"        # FP baseline (slow, needs full model in memory)
 # Generation
 MAX_NEW_TOKENS=1024
 TEMPERATURE=0.0        # 0.0 = greedy
-MAX_QUESTIONS=80       # 80 = full MT-Bench
+MAX_QUESTIONS=3        # 80 = full MT-Bench (set to 3 for testing)
 
 # GPT-4 Judging (requires OPENAI_API_KEY env var)
 JUDGE="false"          # Set to "true" to enable GPT-4 scoring
