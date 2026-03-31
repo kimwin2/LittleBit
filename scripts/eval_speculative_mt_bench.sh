@@ -32,6 +32,10 @@ DRAFT_MODEL_PATH="outputs/step1_draft_0.1bit/2026_03_28_15_10_runtime"
 # Residual model (HF format, used on GPU)
 RESIDUAL_MODEL_PATH="outputs/step2_residual_0.9bit/2026_03_29_13_24"
 
+# HF-format draft model path for target model's draft component
+# (MatryoshkaTargetModel needs HF format, not runtime)
+TARGET_DRAFT_MODEL_PATH="outputs/step1_draft_0.1bit/2026_03_28_15_10"
+
 # Target mode: "matryoshka" = draft + residual combined
 TARGET_MODE="matryoshka"
 
@@ -83,6 +87,7 @@ python eval_speculative_mt_bench.py \
     --base_model_id "${BASE_MODEL_ID}" \
     --draft_model_path "${DRAFT_MODEL_PATH}" \
     --residual_model_path "${RESIDUAL_MODEL_PATH}" \
+    --target_draft_model_path "${TARGET_DRAFT_MODEL_PATH}" \
     --target_mode "${TARGET_MODE}" \
     --draft_device "${DRAFT_DEVICE}" \
     --draft_length ${DRAFT_LENGTH} \

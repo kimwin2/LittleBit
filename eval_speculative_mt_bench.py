@@ -30,7 +30,8 @@ import torch
 
 from speculative_decoding import (
     speculative_decode, autoregressive_generate,
-    load_target_model, load_draft_model, str2bool,
+    MatryoshkaTargetModel, FPTargetModel,
+    load_draft_model, str2bool,
 )
 from utils.datautils import load_tokenizer
 from utils.misc import setup_logger
@@ -163,8 +164,22 @@ def run_eval(args):
     logger.info("Loading draft model...")
     draft_model = load_draft_model(args, device)
 
+    # Load target model
+    # For matryoshka mode, we need the HF-format draft path (not runtime)
     logger.info("Loading target model...")
-    target_model = load_target_model(args, device)
+    if args.target_mode == "matryoshka":
+        # Use target_draft_model_path (HF format) for the target's draft component
+        hf_draft_path = args.target_draft_model_path or args.draft_model_path
+        target_model = MatryoshkaTargetModel(
+            draft_model_path=hf_draft_path,
+            residual_model_path=args.residual_model_path,
+            torch_dtype=torch.bfloat16,
+            device=str(device),
+        )
+    else:
+        target_model = FPTargetModel(
+            args.base_model_id, torch_dtype=torch.bfloat16, device=str(device)
+        )
 
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -419,6 +434,8 @@ def main():
                         help="Path to draft model (HF checkpoint or runtime dir)")
     parser.add_argument("--residual_model_path", type=str, default=None,
                         help="Path to 0.9-bit residual model (for target_mode=matryoshka)")
+    parser.add_argument("--target_draft_model_path", type=str, default=None,
+                        help="Path to HF-format draft model for target (if --draft_model_path is runtime format)")
     parser.add_argument("--target_mode", type=str, default="matryoshka",
                         choices=["fp", "matryoshka"],
                         help="Target model: fp=original FP, matryoshka=0.1+0.9 combined")
