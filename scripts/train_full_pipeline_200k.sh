@@ -1,10 +1,11 @@
 #!/bin/bash
 # ==============================================================================
-# Full Pipeline: Train 0.1-bit Draft + 0.9-bit Residual (Matryoshka Style)
+# Full Pipeline: Train 0.3-bit Draft + 1.7-bit Residual (Matryoshka Style)
 # ==============================================================================
 #
-# 200K sample variant of train_full_pipeline.sh
-# Uses 200,000 OpenHermes samples instead of the default 50,000.
+# 200K sample variant.
+# Step 2 memory-optimized: only rank 0 does heavy residual weight
+# computation, other ranks load the result from temp file.
 #
 # ==============================================================================
 
@@ -15,7 +16,7 @@ set -e
 # ===========================
 
 # Model
-MODEL_ID="meta-llama/Llama-3.1-8B-Instruct"
+MODEL_ID="/group-volume/ym1012.kim/homepc/LittleSpec/Llama-3.1-8B-Instruct"
 
 # Dataset: "openhermes" uses OpenHermes 2.5 with Llama 3.1 chat template
 DATASET="openhermes"
@@ -26,8 +27,8 @@ NUM_SAMPLES=200000
 SHAREGPT_PATH=""
 
 # Output directories
-STEP1_SAVE_DIR="outputs/step1_draft_0.1bit_200k"
-STEP2_SAVE_DIR="outputs/step2_residual_0.9bit_200k"
+STEP1_SAVE_DIR="outputs/step1_draft_0.3bit_200k"
+STEP2_SAVE_DIR="outputs/step2_residual_1.7bit_200k"
 
 # Quantization (shared)
 QUANT_FUNC="STEBinary"
@@ -37,16 +38,16 @@ KV_FACTOR=1.0
 MIN_SPLIT_DIM=8
 
 # Step-specific bit widths
-STEP1_EFF_BIT=0.1
-STEP2_EFF_BIT=0.9
+STEP1_EFF_BIT=0.3
+STEP2_EFF_BIT=1.7
 
 # Training
-NUM_EPOCHS=3
+NUM_EPOCHS=5
 BATCH_SIZE=4
 GRAD_ACC_STEPS=1
-LR=2e-5
+LR=4e-5
 WARMUP_RATIO=0.03
-L2L_LOSS_SCALE=10.0
+L2L_LOSS_SCALE=1.0
 
 # Training-time test (Step 1 only, EAGLE-style multi-step rollout)
 TRAIN_TIME_TEST="false"
@@ -54,13 +55,13 @@ TTT_STEPS=7
 TTT_DECAY=0.8
 
 # DeepSpeed
-NUM_GPUS=4
+NUM_GPUS=8
 DS_CONFIG="configs/zero3.json"
 
 # Logging
-STEP1_RUN_NAME="step1_draft_0.1bit_200k"
-STEP2_RUN_NAME="step2_residual_0.9bit_200k"
-REPORT="wandb"
+STEP1_RUN_NAME="step1_draft_0.3bit_200k"
+STEP2_RUN_NAME="step2_residual_1.7bit_200k"
+REPORT="tensorboard"
 
 # Pipeline control (set to "true" to skip a step)
 SKIP_STEP1="false"

@@ -810,23 +810,8 @@ def save_step2_artifacts(trainer, residual_model, tokenizer, save_dir, args, dra
         raise
 
 
-def run_step2(args, tokenizer, datasets, num_gpus, device_map, draft_model_path, step2_save_dir):
-    """Execute Step 2: Train 0.9-bit residual model using the draft model from Step 1."""
-    logger.info("=" * 60)
-    logger.info("STEP 2: Training 0.9-bit Residual Model")
-    logger.info(f"  Draft model path: {draft_model_path}")
-    logger.info("=" * 60)
-
-    # ===== Step A: Load the original FP model =====
-    logger.info("Loading original FP model for residual computation...")
-    original_model = AutoModelForCausalLM.from_pretrained(
-        args.model_id, torch_dtype=torch.float32, device_map="cpu",
-        low_cpu_mem_usage=True, trust_remote_code=True,
-    )
-
-    # ===== Step B: Load the trained 0.1-bit draft model =====
-    logger.info(f"Loading trained 0.1-bit draft model from {draft_model_path}...")
-
+def _load_draft_config_and_args(draft_model_path):
+    """Load draft model config and create quant args namespace."""
     draft_config_path = os.path.join(draft_model_path, "littlebit_config.json")
     with open(draft_config_path, 'r') as f:
         draft_config = json.load(f)
@@ -841,45 +826,139 @@ def run_step2(args, tokenizer, datasets, num_gpus, device_map, draft_model_path,
         min_split_dim=draft_config.get("min_split_dim", 8),
         model_id=draft_model_path,
     )
+    return draft_config, draft_args
 
+
+def run_step2(args, tokenizer, datasets, num_gpus, device_map, draft_model_path, step2_save_dir):
+    """Execute Step 2: Train residual model using the draft model from Step 1.
+
+    Memory-optimized: The heavy initialization (loading the full FP model,
+    computing residual weights via SVD, initializing the residual model)
+    is performed ONLY on rank 0. The initialized state is saved to a temp
+    file and loaded by all other ranks. This prevents N copies of the full
+    FP model from being loaded into CPU memory simultaneously, which
+    previously caused OOM with many GPUs.
+    """
+    local_rank = int(os.environ.get('LOCAL_RANK', '0'))
+    world_size = int(os.environ.get('WORLD_SIZE', '1'))
+
+    logger.info("=" * 60)
+    logger.info(f"STEP 2: Training Residual Model (rank {local_rank}/{world_size})")
+    logger.info(f"  Draft model path: {draft_model_path}")
+    logger.info("=" * 60)
+
+    # Ensure distributed is initialized for barrier synchronization
+    if world_size > 1 and not torch.distributed.is_initialized():
+        deepspeed.init_distributed()
+
+    temp_init_path = os.path.join(step2_save_dir, "_temp_residual_init.pt")
+
+    # ==================================================================
+    # Phase 1: Heavy initialization (RANK 0 ONLY)
+    #
+    # Previously all N ranks each loaded: original FP model (float32,
+    # ~32GB) + draft model + residual model + residual weights on CPU.
+    # For 8 GPUs this totaled ~768GB CPU RAM → OOM / SIGKILL.
+    #
+    # Now only rank 0 does this work, saves the initialized residual
+    # model state_dict to disk, and other ranks load from it.
+    # ==================================================================
+    if local_rank == 0:
+        logger.info("[Rank 0] Phase 1: Computing & initializing residual weights...")
+
+        # Step A: Load original FP model (bfloat16 to save ~16GB vs float32)
+        logger.info("[Rank 0] Loading original model (bfloat16)...")
+        original_model = AutoModelForCausalLM.from_pretrained(
+            args.model_id, torch_dtype=torch.bfloat16, device_map="cpu",
+            low_cpu_mem_usage=True, trust_remote_code=True,
+        )
+
+        # Step B: Load draft model for residual computation
+        logger.info(f"[Rank 0] Loading draft model from {draft_model_path}...")
+        _, draft_args = _load_draft_config_and_args(draft_model_path)
+        draft_model_for_init = load_quantized_model(
+            model_path=draft_model_path, quant_args=draft_args,
+            torch_dtype=torch.bfloat16, device="cpu",
+        )
+
+        # Step C: Compute residual weights
+        logger.info("[Rank 0] Computing residual weights (W_original - W_draft_approx)...")
+        residual_weights = compute_residual_weights(original_model, draft_model_for_init, device='cpu')
+
+        del original_model, draft_model_for_init
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # Step D: Create residual model, apply patch, initialize from residuals
+        logger.info("[Rank 0] Creating & initializing residual model...")
+        residual_model_init = AutoModelForCausalLM.from_pretrained(
+            args.model_id, torch_dtype=torch.bfloat16, device_map="cpu",
+            low_cpu_mem_usage=True, trust_remote_code=True,
+        )
+        residual_model_init.config.use_cache = False
+
+        step2_args = argparse.Namespace(**vars(args))
+        step2_args.eff_bit = args.step2_eff_bit
+        logger.info(f"[Rank 0] Applying LittleBit patch with eff_bit={args.step2_eff_bit}...")
+        residual_model_init = apply_littlebit_patch(residual_model_init, step2_args, do_train=True)
+
+        logger.info("[Rank 0] Initializing residual model from computed residual weights...")
+        initialize_residual_model_weights(residual_model_init, residual_weights)
+        del residual_weights
+        gc.collect()
+
+        # Step E: Save initialized state to temp file
+        logger.info(f"[Rank 0] Saving initialized state to {temp_init_path}...")
+        torch.save(residual_model_init.state_dict(), temp_init_path)
+
+        del residual_model_init
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        logger.info("[Rank 0] Phase 1 complete.")
+    else:
+        logger.info(f"[Rank {local_rank}] Waiting for rank 0 to finish residual init...")
+
+    # Barrier: wait for rank 0 to finish
+    if world_size > 1:
+        torch.distributed.barrier()
+        logger.info(f"[Rank {local_rank}] Barrier passed.")
+
+    # ==================================================================
+    # Phase 2: All ranks load lightweight components
+    # ==================================================================
+
+    # Load draft model (all ranks need this for combined model during training)
+    logger.info(f"[Rank {local_rank}] Loading draft model...")
+    _, draft_args = _load_draft_config_and_args(draft_model_path)
     draft_model = load_quantized_model(
-        model_path=draft_model_path,
-        quant_args=draft_args,
-        torch_dtype=torch.bfloat16,
-        device="cpu",
+        model_path=draft_model_path, quant_args=draft_args,
+        torch_dtype=torch.bfloat16, device="cpu",
     )
 
-    # ===== Step C: Compute residual weights =====
-    logger.info("Computing residual weights (W_original - W_draft_approx)...")
-    residual_weights = compute_residual_weights(original_model, draft_model, device='cpu')
-
-    del original_model
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    # ===== Step D: Create and initialize residual model (0.9-bit) =====
-    logger.info("Creating 0.9-bit residual model...")
+    # Create residual model structure + load initialized weights from rank 0
+    logger.info(f"[Rank {local_rank}] Creating residual model & loading initialized weights...")
     residual_model = AutoModelForCausalLM.from_pretrained(
         args.model_id, torch_dtype=torch.bfloat16, device_map="cpu",
         low_cpu_mem_usage=True, trust_remote_code=True,
     )
     residual_model.config.use_cache = False
 
-    # Apply LittleBit patch with 0.9-bit configuration
     step2_args = argparse.Namespace(**vars(args))
     step2_args.eff_bit = args.step2_eff_bit
-
-    logger.info(f"Applying LittleBit patch with eff_bit={args.step2_eff_bit}...")
     residual_model = apply_littlebit_patch(residual_model, step2_args, do_train=True)
 
-    # Re-initialize from residual weights
-    logger.info("Initializing residual model from computed residual weights...")
-    initialize_residual_model_weights(residual_model, residual_weights)
-    del residual_weights
+    # Load the initialized weights computed by rank 0
+    logger.info(f"[Rank {local_rank}] Loading initialized state from {temp_init_path}...")
+    init_state = torch.load(temp_init_path, map_location='cpu')
+    residual_model.load_state_dict(init_state, strict=False)
+    del init_state
     gc.collect()
 
-    # ===== Step E: Create combined Matryoshka model =====
+    # ==================================================================
+    # Phase 3: Create combined model & train (same as before)
+    # ==================================================================
     logger.info("Creating Matryoshka combined model (draft frozen + residual trainable)...")
     combined_model = MatryoshkaResidualModel(
         draft_model=draft_model,
@@ -902,9 +981,7 @@ def run_step2(args, tokenizer, datasets, num_gpus, device_map, draft_model_path,
 
     combined_model.residual_model.gradient_checkpointing_enable()
 
-    # Move draft model to GPU explicitly (it's not managed by DeepSpeed).
-    # The residual model will be placed by DeepSpeed during trainer.train().
-    local_rank = int(os.environ.get('LOCAL_RANK', '0'))
+    # Move draft model to GPU explicitly (not managed by DeepSpeed)
     draft_device = f'cuda:{local_rank}'
     logger.info(f"Moving draft model to {draft_device} (not managed by DeepSpeed)...")
     combined_model.draft_model.to(draft_device)
@@ -912,8 +989,7 @@ def run_step2(args, tokenizer, datasets, num_gpus, device_map, draft_model_path,
 
     print_trainable_parameters(combined_model.residual_model)
 
-    # ===== Step E.5: Diagnostic check before training =====
-    # Move residual model to GPU temporarily for diagnostic
+    # Diagnostic check before training
     residual_model.to(draft_device)
     diagnose_step2_models(
         draft_model=combined_model.draft_model,
@@ -921,11 +997,11 @@ def run_step2(args, tokenizer, datasets, num_gpus, device_map, draft_model_path,
         tokenizer=tokenizer,
         device=draft_device,
     )
-    residual_model.to('cpu')  # Move back to CPU for DeepSpeed initialization
+    residual_model.to('cpu')
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    # ===== Step F: Train =====
+    # Train
     logger.info("Loading teacher model for KD...")
     teacher_model = load_teacher_model(args, num_gpus, torch.bfloat16)
 
@@ -941,10 +1017,10 @@ def run_step2(args, tokenizer, datasets, num_gpus, device_map, draft_model_path,
         data_collator=default_data_collator,
     )
 
-    logger.info("Starting Step 2 QAT training (0.9-bit residual model)...")
+    logger.info("Starting Step 2 QAT training...")
     trainer.train()
 
-    # ===== Step G: Save =====
+    # Save
     save_step2_artifacts(trainer, combined_model, tokenizer, step2_save_dir, args, draft_model_path)
 
     logger.info("=" * 60)
@@ -952,6 +1028,14 @@ def run_step2(args, tokenizer, datasets, num_gpus, device_map, draft_model_path,
     logger.info(f"Residual model saved to: {step2_save_dir}")
     logger.info(f"Draft model path: {draft_model_path}")
     logger.info("=" * 60)
+
+    # Cleanup temp file
+    if local_rank == 0 and os.path.exists(temp_init_path):
+        try:
+            os.remove(temp_init_path)
+            logger.info(f"Removed temp file: {temp_init_path}")
+        except OSError:
+            pass
 
     del combined_model, teacher_model, trainer
     gc.collect()
