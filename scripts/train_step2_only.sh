@@ -1,10 +1,12 @@
 #!/bin/bash
 # ==============================================================================
-# Step 2 Only: Train 0.9-bit Residual Model (skip Step 1)
+# Step 2 Only: Train 1.7-bit Residual Model (skip Step 1)
 # ==============================================================================
 #
-# Use this when Step 1 (draft model) already completed successfully
+# Use this when Step 1 (0.3-bit draft model) already completed successfully
 # but Step 2 failed or needs to be re-run.
+#
+# Step 1 output: /group-volume/ym1012.kim/homepc/LittleSpec/outputs/step1_draft_0.3bit_200k/2026_03_31_18_15
 #
 # ==============================================================================
 
@@ -14,19 +16,20 @@ set -e
 # USER CONFIGURATION
 # ===========================
 
-# Model
-MODEL_ID="/group-volume/ym1012.kim/homepc/EAGLE/Llama-3.1-8B-Instruct"
+# Model (same as the crashed pipeline)
+MODEL_ID="/group-volume/ym1012.kim/homepc/LittleSpec/Llama-3.1-8B-Instruct"
 
 # Dataset
 DATASET="openhermes"
 DATA_ROOT="./"
+NUM_SAMPLES=200000
 
 # Draft model from completed Step 1
-DRAFT_MODEL_PATH="outputs/step1_draft_0.1bit/2026_03_28_15_10"
+DRAFT_MODEL_PATH="/group-volume/ym1012.kim/homepc/LittleSpec/outputs/step1_draft_0.3bit_200k/2026_03_31_18_15"
 
-# Output directories
-STEP1_SAVE_DIR="outputs/step1_draft_0.1bit"
-STEP2_SAVE_DIR="outputs/step2_residual_0.9bit"
+# Output directories (must match the original pipeline structure)
+STEP1_SAVE_DIR="outputs/step1_draft_0.3bit_200k"
+STEP2_SAVE_DIR="outputs/step2_residual_1.7bit_200k"
 
 # Quantization
 QUANT_FUNC="STEBinary"
@@ -35,11 +38,11 @@ RESIDUAL="false"
 KV_FACTOR=1.0
 MIN_SPLIT_DIM=8
 
-# Step-specific bit widths
-STEP1_EFF_BIT=0.1
-STEP2_EFF_BIT=0.9
+# Step-specific bit widths (must match the original pipeline)
+STEP1_EFF_BIT=0.3
+STEP2_EFF_BIT=1.7
 
-# Training
+# Training (same as crashed pipeline)
 NUM_EPOCHS=5
 BATCH_SIZE=4
 GRAD_ACC_STEPS=1
@@ -52,32 +55,58 @@ TRAIN_TIME_TEST="false"
 TTT_STEPS=7
 TTT_DECAY=0.8
 
-# DeepSpeed
-NUM_GPUS=4
+# DeepSpeed (original used 8 GPUs)
+NUM_GPUS=8
 DS_CONFIG="configs/zero3.json"
 
 # Logging
-STEP1_RUN_NAME="step1_draft_0.1bit"
-STEP2_RUN_NAME="step2_residual_0.9bit"
+STEP1_RUN_NAME="step1_draft_0.3bit_200k"
+STEP2_RUN_NAME="step2_residual_1.7bit_200k"
 REPORT="tensorboard"
+
+# ===========================
+# VALIDATE
+# ===========================
+
+if [ ! -d "${DRAFT_MODEL_PATH}" ]; then
+    echo "ERROR: Draft model directory not found: ${DRAFT_MODEL_PATH}"
+    echo "  Step 1 must be completed first."
+    exit 1
+fi
+
+if [ ! -f "${DRAFT_MODEL_PATH}/littlebit_config.json" ]; then
+    echo "ERROR: No littlebit_config.json found in ${DRAFT_MODEL_PATH}"
+    echo "  This doesn't look like a valid Step 1 output."
+    exit 1
+fi
+
+echo "Draft model config:"
+cat "${DRAFT_MODEL_PATH}/littlebit_config.json"
+echo ""
 
 # ===========================
 # LAUNCH (Step 2 only)
 # ===========================
 
 echo "============================================================"
-echo "Step 2 Only: Train 0.9-bit Residual Model"
+echo "Step 2 Only: Train ${STEP2_EFF_BIT}-bit Residual Model"
 echo "  Model:       ${MODEL_ID}"
-echo "  Dataset:     ${DATASET}"
+echo "  Dataset:     ${DATASET} (${NUM_SAMPLES} samples)"
 echo "  Draft model: ${DRAFT_MODEL_PATH}"
+echo "  Step1 bit:   ${STEP1_EFF_BIT}"
+echo "  Step2 bit:   ${STEP2_EFF_BIT}"
 echo "  Output:      ${STEP2_SAVE_DIR}"
 echo "  GPUs:        ${NUM_GPUS}"
+echo "  Epochs:      ${NUM_EPOCHS}"
+echo "  LR:          ${LR}"
+echo "  L2L scale:   ${L2L_LOSS_SCALE}"
 echo "============================================================"
 
 deepspeed --num_gpus=${NUM_GPUS} train_full_pipeline.py \
     --model_id ${MODEL_ID} \
     --dataset ${DATASET} \
     --data_root ${DATA_ROOT} \
+    --num_samples ${NUM_SAMPLES} \
     --step1_save_dir ${STEP1_SAVE_DIR} \
     --step2_save_dir ${STEP2_SAVE_DIR} \
     --step1_eff_bit ${STEP1_EFF_BIT} \
