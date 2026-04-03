@@ -19,72 +19,80 @@ def str2bool(value):
         raise Exception(f'Boolean value expected: {value}')
 
 
-class EvalLM(BaseLM):
-    def __init__(self, model, tokenizer, batch_size=1, accelerator=None):
-        super().__init__()
-        self.batch_size_per_gpu = batch_size
-        self.seqlen = 2048
-        self.tokenizer = tokenizer
+def _make_eval_lm_class(BaseLM):
+    """Create the EvalLM class dynamically with the given BaseLM parent.
 
-        if accelerator is not None:
-            self.accelerator = accelerator
-            self._device = accelerator.device
-            self.model = model
-        else:
-            self.accelerator = None
-            self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            self.model = model.to(self._device)
+    This avoids a top-level dependency on lm_eval which may not be installed.
+    """
 
-        self.model.eval()
-        self.vocab_size = self.tokenizer.vocab_size
+    class EvalLM(BaseLM):
+        def __init__(self, model, tokenizer, batch_size=1, accelerator=None):
+            super().__init__()
+            self.batch_size_per_gpu = batch_size
+            self.seqlen = 2048
+            self.tokenizer = tokenizer
 
-    @property
-    def eot_token_id(self):
-        return self.tokenizer.eos_token_id
-
-    @property
-    def max_length(self):
-        actual_model = self.model.module if hasattr(self.model, "module") else self.model
-        return getattr(actual_model.config, "n_ctx", actual_model.config.max_position_embeddings)
-
-    @property
-    def max_gen_toks(self):
-        return 256
-
-    @property
-    def batch_size(self):
-        return self.batch_size_per_gpu
-
-    def tok_encode(self, string: str):
-        return self.tokenizer.encode(string, add_special_tokens=False)
-
-    def tok_decode(self, tokens):
-        return self.tokenizer.decode(tokens)
-
-    def _model_call(self, inps):
-        with torch.no_grad():
-            outputs = self.model(inps, use_cache=False)
-            if hasattr(outputs, "logits"):
-                return outputs.logits
-            elif isinstance(outputs, dict) and "logits" in outputs:
-                return outputs["logits"]
+            if accelerator is not None:
+                self.accelerator = accelerator
+                self._device = accelerator.device
+                self.model = model
             else:
-                return outputs
+                self.accelerator = None
+                self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                self.model = model.to(self._device)
 
-    def _model_generate(self, context, max_length, eos_token_id):
-        with torch.no_grad():
+            self.model.eval()
+            self.vocab_size = self.tokenizer.vocab_size
+
+        @property
+        def eot_token_id(self):
+            return self.tokenizer.eos_token_id
+
+        @property
+        def max_length(self):
             actual_model = self.model.module if hasattr(self.model, "module") else self.model
-            return actual_model.generate(
-                context,
-                max_length=max_length,
-                eos_token_id=eos_token_id,
-                do_sample=False,
-            )
+            return getattr(actual_model.config, "n_ctx", actual_model.config.max_position_embeddings)
 
-    @property
-    def device(self):
-        # TODO: fix multi-gpu
-        return self._device
+        @property
+        def max_gen_toks(self):
+            return 256
+
+        @property
+        def batch_size(self):
+            return self.batch_size_per_gpu
+
+        def tok_encode(self, string: str):
+            return self.tokenizer.encode(string, add_special_tokens=False)
+
+        def tok_decode(self, tokens):
+            return self.tokenizer.decode(tokens)
+
+        def _model_call(self, inps):
+            with torch.no_grad():
+                outputs = self.model(inps, use_cache=False)
+                if hasattr(outputs, "logits"):
+                    return outputs.logits
+                elif isinstance(outputs, dict) and "logits" in outputs:
+                    return outputs["logits"]
+                else:
+                    return outputs
+
+        def _model_generate(self, context, max_length, eos_token_id):
+            with torch.no_grad():
+                actual_model = self.model.module if hasattr(self.model, "module") else self.model
+                return actual_model.generate(
+                    context,
+                    max_length=max_length,
+                    eos_token_id=eos_token_id,
+                    do_sample=False,
+                )
+
+        @property
+        def device(self):
+            # TODO: fix multi-gpu
+            return self._device
+
+    return EvalLM
 
 
 @torch.no_grad()
@@ -98,6 +106,11 @@ def evaluate_model(
     batch_size=1,
     accelerator=None,
 ):
+    from lm_eval import evaluator
+    from lm_eval.base import BaseLM
+
+    EvalLM = _make_eval_lm_class(BaseLM)
+
     lm = EvalLM(model, tokenizer, batch_size=batch_size, accelerator=accelerator)
     results = {}
     if eval_ppl:
@@ -276,8 +289,6 @@ def main(args):
 
     # === Standard path: model_type + LM.from_pretrained (requires modeling + lm_eval) ===
     else:
-        from lm_eval import evaluator
-        from lm_eval.base import BaseLM
         from modeling import (LittleBitGemma2ForCausalLM, LittleBitGemma3ForCausalLM, LittleBitLlamaForCausalLM,
                               LittleBitOPTForCausalLM, LittleBitPhi4ForCausalLM, LittleBitQwQForCausalLM)
 
