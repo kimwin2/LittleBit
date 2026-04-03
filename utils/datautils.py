@@ -132,6 +132,8 @@ def get_qat_dataset(name, tokenizer, sharegpt_path=None, data_root="./", num_sam
         data = get_wikitext2_sharegpt_train(tokenizer=tokenizer, sharegpt_path=sharegpt_path)
     elif name == "openhermes":
         data = get_openhermes_train(tokenizer=tokenizer, data_root=data_root, num_samples=num_samples)
+    elif name == "mixed_hermes_wiki_c4":
+        data = get_mixed_hermes_wiki_c4_train(tokenizer=tokenizer, data_root=data_root, num_samples=num_samples)
     return data
 
 
@@ -451,6 +453,104 @@ def get_openhermes_train(tokenizer, num_samples=50000, seed=42, seqlen=2048, dat
     })
 
     return processed_dataset
+
+
+
+def get_mixed_hermes_wiki_c4_train(tokenizer, num_samples=100000, seed=42, seqlen=2048, data_root="./"):
+    """Mixed dataset: OpenHermes (100k chat) + WikiText2 (raw text) + C4 first shard half.
+
+    Composition:
+      - OpenHermes 2.5: num_samples conversations (chat template applied)
+      - WikiText2 train: full raw text (tokenized + chunked)
+      - C4 shard 0: first 50% of en/c4-train.00000-of-01024.json.gz (raw text, tokenized + chunked)
+
+    All three are independently tokenized into seqlen-length samples, then concatenated.
+    """
+    all_datasets = []
+
+    # === Part 1: OpenHermes (chat-templated) ===
+    logger.info(f"[mixed] Loading OpenHermes 2.5 ({num_samples} samples)...")
+    hermes_data = get_openhermes_train(
+        tokenizer=tokenizer, data_root=data_root,
+        num_samples=num_samples, seed=seed, seqlen=seqlen,
+    )
+    logger.info(f"[mixed] OpenHermes: {len(hermes_data)} samples")
+    all_datasets.append(hermes_data)
+
+    # === Part 2: WikiText2 train (raw text) ===
+    logger.info("[mixed] Loading WikiText2 train...")
+    wiki_data = get_wikitext2_train(tokenizer=tokenizer, seqlen=seqlen)
+    logger.info(f"[mixed] WikiText2: {len(wiki_data)} samples")
+    all_datasets.append(wiki_data)
+
+    # === Part 3: C4 first shard, first 50% ===
+    logger.info("[mixed] Loading C4 first shard (50%)...")
+    try:
+        c4_raw = load_dataset(
+            "allenai/c4",
+            data_files={"train": "en/c4-train.00000-of-01024.json.gz"},
+            split="train",
+        )
+        half = len(c4_raw) // 2
+        c4_raw = c4_raw.select(range(half))
+        logger.info(f"[mixed] C4 raw documents (50%): {len(c4_raw)}")
+
+        # Tokenize C4 text
+        c4_text = "\n\n".join(c4_raw["text"])
+        CHUNK_SIZE = 1_000_000
+        text_chunks = [c4_text[i:i+CHUNK_SIZE] for i in range(0, len(c4_text), CHUNK_SIZE)
+                       if c4_text[i:i+CHUNK_SIZE].strip()]
+        logger.info(f"[mixed] C4 text: {len(c4_text):,} chars -> {len(text_chunks)} chunks")
+
+        c4_dataset = datasets.Dataset.from_dict({"text": text_chunks})
+
+        def tokenize_fn(examples):
+            return tokenizer(examples["text"])
+
+        c4_tokenized = c4_dataset.map(tokenize_fn, batched=True,
+                                       remove_columns=["text"], num_proc=4,
+                                       desc="Tokenizing C4")
+
+        block_size = seqlen
+        def group_texts(examples):
+            concatenated = {k: list(chain(*examples[k])) for k in examples.keys()}
+            total_length = len(concatenated[list(examples.keys())[0]])
+            if total_length >= block_size:
+                total_length = (total_length // block_size) * block_size
+            result = {
+                k: [t[i:i+block_size] for i in range(0, total_length, block_size)]
+                for k, t in concatenated.items()
+            }
+            result["labels"] = result["input_ids"].copy()
+            return result
+
+        c4_processed = c4_tokenized.map(group_texts, batched=True, desc="Chunking C4")
+        logger.info(f"[mixed] C4: {len(c4_processed)} samples")
+        all_datasets.append(c4_processed)
+
+        del c4_raw, c4_text
+        import gc; gc.collect()
+    except Exception as e:
+        logger.warning(f"[mixed] Failed to load C4: {e}. Skipping C4 component.")
+
+    # === Merge all ===
+    # Ensure all datasets have the same columns
+    common_cols = set(all_datasets[0].column_names)
+    for ds in all_datasets[1:]:
+        common_cols &= set(ds.column_names)
+
+    aligned = []
+    for ds in all_datasets:
+        extra = set(ds.column_names) - common_cols
+        if extra:
+            ds = ds.remove_columns(list(extra))
+        aligned.append(ds)
+
+    merged = concatenate_datasets(aligned)
+    merged = merged.shuffle(seed=seed)
+    logger.info(f"[mixed] Final merged dataset: {len(merged)} samples")
+
+    return merged
 
 
 def get_eval_loaders(name, tokenizer):
