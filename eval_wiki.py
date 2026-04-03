@@ -287,9 +287,104 @@ def eval_ppl_standalone(model, tokenizer, datasets="wikitext2", seqlen=None):
     return results
 
 
+@torch.no_grad()
+def eval_ppl_combined(draft_model, residual_model, tokenizer, datasets="wikitext2", seqlen=None):
+    """PPL evaluation for target model = draft_logits + residual_logits.
+
+    Loads both draft and residual models, runs forward pass on each,
+    sums their logits, and computes perplexity on the combined output.
+    This matches the Matryoshka target model used in training and speculative decoding.
+
+    Args:
+        draft_model: Draft LittleBit model (already on device).
+        residual_model: Residual LittleBit model (already on device).
+        tokenizer: Tokenizer.
+        datasets: Comma-separated dataset names.
+        seqlen: Sequence length for evaluation chunks. If None, auto-detect.
+    """
+    device = next(draft_model.parameters()).device
+    draft_model.eval()
+    residual_model.eval()
+
+    # Auto-detect seqlen from model config
+    if seqlen is None:
+        actual_model = draft_model.module if hasattr(draft_model, "module") else draft_model
+        seqlen = getattr(actual_model.config, "n_ctx",
+                         getattr(actual_model.config, "max_position_embeddings", 2048))
+        if seqlen > 2048:
+            seqlen = 2048
+    print(f"[INFO] Using seqlen = {seqlen}")
+
+    results = {}
+
+    for dataset in datasets.split(","):
+        dataset = dataset.strip()
+        if not dataset:
+            continue
+
+        print(f"[INFO] Starting PPL eval for: {dataset} (target = draft + residual)")
+        testloader = get_eval_loaders(dataset, tokenizer)
+        testenc = testloader.input_ids
+        nsamples = testenc.numel() // seqlen
+
+        if nsamples == 0:
+            print(f"Not enough data for PPL evaluation on {dataset} with seqlen {seqlen}. Skipping.")
+            continue
+
+        nlls = []
+        for i in tqdm(range(nsamples), desc=f"PPL({dataset})"):
+            batch = testenc[:, (i * seqlen):((i + 1) * seqlen)].to(device)
+
+            # Forward through both models and sum logits
+            draft_out = draft_model(batch, use_cache=False)
+            residual_out = residual_model(batch, use_cache=False)
+
+            draft_logits = draft_out.logits if hasattr(draft_out, "logits") else draft_out["logits"]
+            residual_logits = residual_out.logits if hasattr(residual_out, "logits") else residual_out["logits"]
+            combined_logits = draft_logits + residual_logits
+
+            shift_logits = combined_logits[:, :-1, :].contiguous()
+            shift_labels = batch[:, 1:].contiguous()
+
+            loss_fct = nn.CrossEntropyLoss()
+            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+            neg_log_likelihood = loss.float() * (seqlen - 1)
+            nlls.append(neg_log_likelihood)
+
+        ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * (seqlen - 1)))
+        print(f"[{dataset}] PPL = {ppl.item():.4f}")
+        results[dataset] = ppl.item()
+
+    return results
+
+
 def main(args):
-    # === Draft model path: load via load_quantized_model ===
-    if args.draft_model_path:
+    # === Target model (draft + residual): load both and sum logits ===
+    if args.draft_model_path and args.residual_model_path:
+        print(f"[INFO] Loading TARGET model (draft + residual)")
+        print(f"[INFO]   Draft:    {args.draft_model_path}")
+        print(f"[INFO]   Residual: {args.residual_model_path}")
+
+        draft_model, tokenizer = load_draft_model_for_eval(
+            draft_model_path=args.draft_model_path,
+            base_model_id=args.model_id,
+            device="auto",
+        )
+        residual_model, _ = load_draft_model_for_eval(
+            draft_model_path=args.residual_model_path,
+            base_model_id=args.model_id,
+            device="auto",
+        )
+
+        eval_ppl_combined(
+            draft_model=draft_model,
+            residual_model=residual_model,
+            tokenizer=tokenizer,
+            datasets=args.ppl_task,
+        )
+
+    # === Draft model only ===
+    elif args.draft_model_path:
         print(f"[INFO] Loading draft model from: {args.draft_model_path}")
         model, tokenizer = load_draft_model_for_eval(
             draft_model_path=args.draft_model_path,
@@ -297,7 +392,6 @@ def main(args):
             device="auto",
         )
 
-        # Standalone PPL eval (no lm_eval / BaseLM dependency)
         eval_ppl_standalone(
             model=model,
             tokenizer=tokenizer,
@@ -372,6 +466,9 @@ if __name__ == "__main__":
     parser.add_argument("--draft_model_path", type=str, default=None,
                         help="Path to a LittleBit draft model checkpoint (with littlebit_config.json). "
                              "When set, loads the model via load_quantized_model instead of model_type.")
+    parser.add_argument("--residual_model_path", type=str, default=None,
+                        help="Path to a LittleBit residual model checkpoint. "
+                             "When set together with --draft_model_path, evaluates target = draft + residual.")
     parser.add_argument("--ppl_task", type=str, default="wikitext2,c4",
                         help="Perplexity evaluation dataset (comma-separated)")
     parser.add_argument("--zeroshot_task", type=str, default="boolq,piqa,hellaswag,winogrande,arc_easy,arc_challenge",
