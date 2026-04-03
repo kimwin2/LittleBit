@@ -256,6 +256,47 @@ def _load_and_process_state_dict(model_path: str, torch_dtype: torch.dtype):
     return final_state_dict, True
 
 
+def _fix_split_dim_mismatches(model, state_dict):
+    """Detect and fix split_dim mismatches between model skeleton and checkpoint.
+
+    When eff_bit in littlebit_config.json doesn't match the eff_bit used during
+    training, the model skeleton's LittleBitLinear modules will have a different
+    split_dim than the checkpoint's actual tensor shapes. This function detects
+    such mismatches and re-initializes the modules with the correct split_dim.
+    """
+    fixed_count = 0
+
+    for name, module in model.named_modules():
+        if not isinstance(module, LittleBitLinear):
+            continue
+
+        # Look for U tensor in state_dict to detect actual split_dim
+        u_key = f"{name}.U"
+        if u_key not in state_dict:
+            continue
+
+        actual_u_shape = state_dict[u_key].shape
+        # U shape is [out_features, split_dim]
+        actual_split_dim = actual_u_shape[1]
+
+        if actual_split_dim != module.split_dim:
+            print(f"INFO: Fixing split_dim mismatch for {name}: "
+                  f"model={module.split_dim} -> checkpoint={actual_split_dim}")
+            module.split_dim = actual_split_dim
+            # Re-initialize empty parameters with the correct split_dim
+            module._initialize_empty_parameters()
+            # Update registered buffers
+            module._split_dim_final = torch.tensor(actual_split_dim)
+            eff_bit_actual = module._compute_eff_bits(
+                module.in_features, module.out_features, actual_split_dim, module.residual
+            )
+            module._eff_bit_actual = torch.tensor(eff_bit_actual)
+            fixed_count += 1
+
+    if fixed_count > 0:
+        print(f"INFO: Fixed split_dim for {fixed_count} LittleBitLinear modules")
+
+
 def load_quantized_model(model_path: str, quant_args, torch_dtype, device: str = "auto"):
     """
     Loads a pre-quantized model from a directory.
@@ -315,6 +356,13 @@ def load_quantized_model(model_path: str, quant_args, torch_dtype, device: str =
     # 3. Load Weights
     print("INFO: Loading state dictionary...")
     state_dict, was_unpacked = _load_and_process_state_dict(model_path, torch_dtype)
+
+    # 3.5 Fix shape mismatches: detect actual split_dim from checkpoint and
+    #     re-initialize LittleBitLinear modules if their computed split_dim
+    #     differs from the checkpoint's actual shapes.
+    #     This handles cases where littlebit_config.json's eff_bit doesn't
+    #     match what was actually used during training.
+    _fix_split_dim_mismatches(model, state_dict)
 
     # Load into model
     missing, unexpected = model.load_state_dict(state_dict, strict=False, assign=True)
