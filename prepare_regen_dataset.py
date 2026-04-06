@@ -34,7 +34,9 @@ import json
 import os
 import time
 
+import torch
 from datasets import load_dataset, load_from_disk, Dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from utils.misc import setup_logger
 
