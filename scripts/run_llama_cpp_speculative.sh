@@ -236,6 +236,17 @@ print(f'=== Draft CPU kernel result ===')
 print(f'  Tokens: ${GEN_TOKENS}')
 print(f'  Time:   {elapsed:.2f}s')
 print(f'  Speed:  {tps:.2f} t/s')
+
+# Decode and print generated text
+from transformers import AutoTokenizer
+tok = AutoTokenizer.from_pretrained('${FP_MODEL_DIR}')
+generated_text = tok.decode(tokens, skip_special_tokens=True)
+print(f'')
+print(f'=== Draft Generated Text ===')
+print(f'  Prompt: ${PROMPT}')
+print(f'  Output:')
+print(f'  {generated_text}')
+print(f'============================')
 "
 
 # ===========================
@@ -252,7 +263,7 @@ python eval_speculative.py \
     --draft_model_path ${RUNTIME_CKPT_DIR} \
     --target_mode fp \
     --draft_device cpu_kernel \
-    --benchmark mt_bench \
+    --benchmark humaneval \
     --max_samples ${MAX_SAMPLES} \
     --max_new_tokens ${MAX_NEW_TOKENS} \
     --draft_lengths ${DRAFT_LENGTHS} \
