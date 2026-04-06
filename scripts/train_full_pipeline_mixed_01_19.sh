@@ -1,13 +1,18 @@
 #!/bin/bash
 # ==============================================================================
 # Full Pipeline: Train 0.1-bit Draft + 1.9-bit Residual
-#   Mixed Dataset: OpenHermes 100k + WikiText2 + C4 (half shard 0)
+#   Mixed Dataset: Regenerated OpenHermes 100k + WikiText2 + C4 (half shard 0)
 # ==============================================================================
 #
-# This uses a diverse mixed dataset to improve PPL on standard benchmarks:
-#   - OpenHermes 2.5: 100k chat conversations (with chat template)
-#   - WikiText2 train: full raw text (~2M tokens)
-#   - C4 shard 0 (50%): ~190k web documents (~200M chars)
+# KEY IMPROVEMENT: Uses target-model-regenerated responses instead of original
+# GPT-4 responses from OpenHermes. This ensures the draft model learns the
+# target model's token distribution, leading to higher acceptance rates in
+# speculative decoding (following P-EAGLE / SpecBundle methodology).
+#
+# Pipeline:
+#   Step 0: Regenerate responses using target model (one-time preprocessing)
+#   Step 1: Train 0.1-bit draft model (QAT with KD)
+#   Step 2: Train 1.9-bit residual model (Matryoshka)
 #
 # ==============================================================================
 
@@ -20,14 +25,19 @@ set -e
 # Model
 MODEL_ID="/group-volume/ym1012.kim/homepc/LittleSpec/Llama-3.1-8B-Instruct"
 
-# Dataset: mixed = OpenHermes 100k + WikiText2 + C4 half
-DATASET="mixed_hermes_wiki_c4"
+# Dataset: mixed_regen = Regenerated OpenHermes 100k + WikiText2 + C4 half
+DATASET="mixed_regen_hermes_wiki_c4"
 DATA_ROOT="./"
-NUM_SAMPLES=100000   # OpenHermes sample count (wiki + c4 are added in full)
+NUM_SAMPLES=100000   # OpenHermes prompt count for regeneration
+
+# Regeneration settings
+REGEN_OUTPUT_DIR="./data/regen_hermes"
+REGEN_MAX_NEW_TOKENS=1024
+REGEN_BATCH_SIZE=8
 
 # Output directories
-STEP1_SAVE_DIR="outputs/step1_draft_0.1bit_mixed"
-STEP2_SAVE_DIR="outputs/step2_residual_1.9bit_mixed"
+STEP1_SAVE_DIR="outputs/step1_draft_0.1bit_regen"
+STEP2_SAVE_DIR="outputs/step2_residual_1.9bit_regen"
 
 # Quantization (shared)
 QUANT_FUNC="STEBinary"
@@ -58,24 +68,58 @@ NUM_GPUS=8
 DS_CONFIG="configs/zero3.json"
 
 # Logging
-STEP1_RUN_NAME="step1_draft_0.1bit_mixed"
-STEP2_RUN_NAME="step2_residual_1.9bit_mixed"
+STEP1_RUN_NAME="step1_draft_0.1bit_regen"
+STEP2_RUN_NAME="step2_residual_1.9bit_regen"
 REPORT="tensorboard"
 
 # Pipeline control
+SKIP_STEP0="false"   # Set to "true" to skip regeneration (if already done)
 SKIP_STEP1="false"
 SKIP_STEP2="false"
 DRAFT_MODEL_PATH=""
 
 # ===========================
-# LAUNCH PIPELINE
+# STEP 0: Regenerate Responses (one-time preprocessing)
 # ===========================
 
+if [ "${SKIP_STEP0}" != "true" ]; then
+    echo "============================================================"
+    echo "Step 0: Regenerating responses using target model"
+    echo "  Model:       ${MODEL_ID}"
+    echo "  Prompts:     ${NUM_SAMPLES} from OpenHermes"
+    echo "  Output:      ${REGEN_OUTPUT_DIR}"
+    echo "  Max tokens:  ${REGEN_MAX_NEW_TOKENS}"
+    echo "  Batch size:  ${REGEN_BATCH_SIZE}"
+    echo "============================================================"
+
+    # Check if already generated
+    if [ -f "${REGEN_OUTPUT_DIR}/regen_conversations.jsonl" ]; then
+        echo "Regenerated dataset already exists. Skipping Step 0."
+        echo "  (Delete ${REGEN_OUTPUT_DIR} to force regeneration)"
+    else
+        python prepare_regen_dataset.py \
+            --model_id ${MODEL_ID} \
+            --output_dir ${REGEN_OUTPUT_DIR} \
+            --data_root ${DATA_ROOT} \
+            --num_samples ${NUM_SAMPLES} \
+            --max_new_tokens ${REGEN_MAX_NEW_TOKENS} \
+            --batch_size ${REGEN_BATCH_SIZE} \
+            --dtype bfloat16
+    fi
+else
+    echo "Skipping Step 0 (regeneration) -- using existing data"
+fi
+
+# ===========================
+# LAUNCH TRAINING PIPELINE
+# ===========================
+
+echo ""
 echo "============================================================"
-echo "Full Pipeline: Matryoshka Training (Mixed Dataset)"
+echo "Full Pipeline: Matryoshka Training (Regenerated Dataset)"
 echo "  Model:    ${MODEL_ID}"
 echo "  Dataset:  ${DATASET}"
-echo "    - OpenHermes: ${NUM_SAMPLES} chat samples"
+echo "    - Regenerated OpenHermes: ${NUM_SAMPLES} (target-model responses)"
 echo "    - WikiText2:  full train split"
 echo "    - C4:         first shard, 50%"
 echo "  Step 1:   ${STEP1_EFF_BIT}-bit draft  -> ${STEP1_SAVE_DIR}"

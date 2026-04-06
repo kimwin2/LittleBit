@@ -1080,7 +1080,7 @@ def get_args():
     # Dataset
     parser.add_argument("--data_root", type=str, default="./")
     parser.add_argument("--dataset", type=str, default="wikitext2_sharegpt",
-                        choices=['c4', 'wikitext2', 'c4_wiki', 'wikitext2_sharegpt', 'openhermes', 'mixed_hermes_wiki_c4'])
+                        choices=['c4', 'wikitext2', 'c4_wiki', 'wikitext2_sharegpt', 'openhermes', 'mixed_hermes_wiki_c4', 'mixed_regen_hermes_wiki_c4'])
     parser.add_argument("--num_samples", type=int, default=50000,
                         help="Number of samples to use from OpenHermes 2.5 (default: 50000)")
     parser.add_argument("--sharegpt_path", type=str, default=None,
