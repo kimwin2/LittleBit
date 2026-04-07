@@ -20,7 +20,7 @@ set -e
 # ===========================
 
 # Base FP16 model (HuggingFace format)
-FP_MODEL_DIR="/group-volume/ym1012.kim/homepc/EAGLE/Llama-3.1-8B-Instruct"
+FP_MODEL_DIR="/group-volume/ym1012.kim/homepc/LittleSpec/Llama-3.1-8B-Instruct"
 
 # HF checkpoint (original trained output)
 HF_CKPT_DIR="/group-volume/ym1012.kim/homepc/LittleSpec/outputs/step1_draft_0.3bit_regen/2026_04_06_16_17"
