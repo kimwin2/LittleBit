@@ -136,6 +136,8 @@ def get_qat_dataset(name, tokenizer, sharegpt_path=None, data_root="./", num_sam
         data = get_mixed_hermes_wiki_c4_train(tokenizer=tokenizer, data_root=data_root, num_samples=num_samples)
     elif name == "mixed_regen_hermes_wiki_c4":
         data = get_mixed_regen_hermes_wiki_c4_train(tokenizer=tokenizer, data_root=data_root, num_samples=num_samples)
+    elif name == "wiki_c4_full":
+        data = get_wiki_c4_full_train(tokenizer=tokenizer)
     return data
 
 
@@ -756,6 +758,90 @@ def get_mixed_regen_hermes_wiki_c4_train(tokenizer, num_samples=100000, seed=42,
     merged = concatenate_datasets(aligned)
     merged = merged.shuffle(seed=seed)
     logger.info(f"[mixed_regen] Final merged dataset: {len(merged)} samples")
+
+    return merged
+
+
+def get_wiki_c4_full_train(tokenizer, seed=42, seqlen=2048):
+    """WikiText2 full + C4 shard 0 full (100%).
+
+    Unlike the mixed datasets which only use 50% of C4 shard 0,
+    this variant uses the entire first shard for maximum data coverage.
+
+    Composition:
+      - WikiText2 train: full raw text (tokenized + chunked to seqlen)
+      - C4 shard 0: full en/c4-train.00000-of-01024.json.gz (100%)
+    """
+    all_datasets = []
+
+    # === Part 1: WikiText2 train (raw text) ===
+    logger.info("[wiki_c4_full] Loading WikiText2 train...")
+    wiki_data = get_wikitext2_train(tokenizer=tokenizer, seqlen=seqlen)
+    logger.info(f"[wiki_c4_full] WikiText2: {len(wiki_data)} samples")
+    all_datasets.append(wiki_data)
+
+    # === Part 2: C4 first shard, full (100%) ===
+    logger.info("[wiki_c4_full] Loading C4 first shard (100%)...")
+    try:
+        c4_raw = load_dataset(
+            "allenai/c4",
+            data_files={"train": "en/c4-train.00000-of-01024.json.gz"},
+            split="train",
+        )
+        logger.info(f"[wiki_c4_full] C4 raw documents (100%): {len(c4_raw)}")
+
+        c4_text = "\n\n".join(c4_raw["text"])
+        CHUNK_SIZE = 1_000_000
+        text_chunks = [c4_text[i:i+CHUNK_SIZE] for i in range(0, len(c4_text), CHUNK_SIZE)
+                       if c4_text[i:i+CHUNK_SIZE].strip()]
+        logger.info(f"[wiki_c4_full] C4 text: {len(c4_text):,} chars -> {len(text_chunks)} chunks")
+
+        c4_dataset = datasets.Dataset.from_dict({"text": text_chunks})
+
+        def tokenize_fn(examples):
+            return tokenizer(examples["text"])
+
+        c4_tokenized = c4_dataset.map(tokenize_fn, batched=True,
+                                       remove_columns=["text"], num_proc=4,
+                                       desc="Tokenizing C4")
+
+        block_size = seqlen
+        def group_texts(examples):
+            concatenated = {k: list(chain(*examples[k])) for k in examples.keys()}
+            total_length = len(concatenated[list(examples.keys())[0]])
+            if total_length >= block_size:
+                total_length = (total_length // block_size) * block_size
+            result = {
+                k: [t[i:i+block_size] for i in range(0, total_length, block_size)]
+                for k, t in concatenated.items()
+            }
+            result["labels"] = result["input_ids"].copy()
+            return result
+
+        c4_processed = c4_tokenized.map(group_texts, batched=True, desc="Chunking C4")
+        logger.info(f"[wiki_c4_full] C4: {len(c4_processed)} samples")
+        all_datasets.append(c4_processed)
+
+        del c4_raw, c4_text
+        import gc; gc.collect()
+    except Exception as e:
+        logger.warning(f"[wiki_c4_full] Failed to load C4: {e}. Skipping C4 component.")
+
+    # === Merge all ===
+    common_cols = set(all_datasets[0].column_names)
+    for ds in all_datasets[1:]:
+        common_cols &= set(ds.column_names)
+
+    aligned = []
+    for ds in all_datasets:
+        extra = set(ds.column_names) - common_cols
+        if extra:
+            ds = ds.remove_columns(list(extra))
+        aligned.append(ds)
+
+    merged = concatenate_datasets(aligned)
+    merged = merged.shuffle(seed=seed)
+    logger.info(f"[wiki_c4_full] Final merged dataset: {len(merged)} samples")
 
     return merged
 
